@@ -6,10 +6,11 @@ import shutil
 import hashlib
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from dev_reset import router as dev_reset_router
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,13 +18,22 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 print("OPENAI_API_KEY present:", bool(OPENAI_API_KEY))
 
-from history_db import init_db, count_history
+from history_db import init_db
 from ai_service import build_ai_input, call_ai_explain
 
-from pro_db import init_pro_db, is_pro_device
-from pro_routes import router as pro_router
-from pro_dev import router as dev_router, is_dev_pro
 from history_routes import router as history_router
+from auth_firebase import init_firebase, CurrentUser, get_current_user
+from user_usage_db import (
+    FREE_LIMIT,
+    can_use_free,
+    get_free_left,
+    get_free_used,
+    increment_free_used,
+    init_user_usage_db,
+    upsert_user,
+)
+from pro_user_db import init_pro_user_db, is_pro_user
+from pro_routes_uid import router as pro_router
 
 import PyPDF2
 from docx import Document
@@ -33,8 +43,6 @@ from pytesseract import Output
 
 
 print("🔥 MAIN FILE LOADED FROM:", __file__)
-
-FREE_LIMIT = 2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -50,12 +58,14 @@ if os.path.exists(TESSERACT_CMD):
 
 app = FastAPI(title="SafeContract API")
 
+init_firebase()
 init_db()
-init_pro_db()
+init_user_usage_db()
+init_pro_user_db()
 
 app.include_router(pro_router)
-app.include_router(dev_router)
 app.include_router(history_router)
+app.include_router(dev_reset_router)
 
 print("✅ history_router loaded")
 
@@ -830,7 +840,7 @@ def normalize_analysis(raw: Dict[str, Any], result_lang: str) -> Dict[str, Any]:
         "red_flags": [r["title"] for r in normalized_risks[:5]],
         "negotiation_points": [r["recommendation"] for r in normalized_risks[:5] if str(r.get("recommendation") or "").strip()][:5],
         "ai_explanation": str(raw.get("ai_explanation") or ""),
-        "analysis_version": "v3_ai_cache_soft",
+        "analysis_version": "v4_user_auth_uid",
     }
     return base
 
@@ -850,7 +860,7 @@ def try_build_ai_input(text: str, analysis: Dict[str, Any], doc_locale: str, res
             next_steps=analysis.get("next_steps") or [],
             strengths=analysis.get("strengths") or [],
             doc_locale=doc_locale,
-            mode=result_lang,  # backwards-compatible if ai_service ignores extras through TypeError fallback below
+            mode=result_lang,
         )
     except TypeError:
         return json.dumps({
@@ -902,11 +912,11 @@ def generate_ai_explanation(
 
 @app.post("/documents/upload")
 async def upload_document(
-    device_id: str = Form(...),
     file: UploadFile = File(...),
     ai: str = Form("false"),
     result_lang: str = Form("en"),
     mode: str = Form("normal"),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     result_lang = (result_lang or "en").lower()
     if result_lang not in SUPPORTED_LANGS:
@@ -916,14 +926,32 @@ async def upload_document(
     if mode not in {"normal", "simple"}:
         mode = "normal"
 
-    dev_pro = is_dev_pro(device_id)
-    pro = is_pro_device(device_id) or dev_pro
-    used = count_history(device_id)
+    upsert_user(
+        uid=current_user.uid,
+        email=current_user.email,
+        name=current_user.name,
+        provider=current_user.provider,
+    )
 
-    print(f"DEBUG pro={pro} dev_pro={dev_pro} device_id={device_id} used={used} limit={FREE_LIMIT}")
+    pro = is_pro_user(current_user.uid)
+    used_before = get_free_used(current_user.uid)
+    free_left_before = get_free_left(current_user.uid)
 
-    if not pro and used >= FREE_LIMIT:
-        raise HTTPException(status_code=403, detail="FREE_LIMIT_EXCEEDED")
+    print(
+        f"DEBUG uid={current_user.uid} provider={current_user.provider} "
+        f"pro={pro} used={used_before} limit={FREE_LIMIT}"
+    )
+
+    if not pro and not can_use_free(current_user.uid):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FREE_LIMIT_EXCEEDED",
+                "free_limit": FREE_LIMIT,
+                "free_used": used_before,
+                "free_left": free_left_before,
+            },
+        )
 
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in {".pdf", ".docx"}:
@@ -981,11 +1009,19 @@ async def upload_document(
                 "ai_explanation": ai_payload.get("ai_explanation", ""),
             })
 
+    free_used_after = used_before
+    free_left_after = free_left_before
+
+    if not pro:
+        free_used_after = increment_free_used(current_user.uid)
+        free_left_after = max(FREE_LIMIT - free_used_after, 0)
+
     response = {
         "analysis_id": str(uuid.uuid4()),
         "filename": name,
         "original_filename": file.filename,
         "is_pro": pro,
+        "user_id": current_user.uid,
         "doc_locale": doc_locale,
         "result_lang": result_lang,
         "analysis_mode": mode,
@@ -996,6 +1032,11 @@ async def upload_document(
         "text_sample": text[:3000],
         "ai_enabled": pro and wants_ai,
         "ai_explanation": analysis.get("ai_explanation", ""),
+        "free_limit": FREE_LIMIT,
+        "free_used_before": used_before,
+        "free_left_before": free_left_before,
+        "free_used_after": free_used_after,
+        "free_left_after": free_left_after,
         **analysis,
     }
 
@@ -1004,4 +1045,4 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v3_ai_cache_soft"}
+    return {"ok": True, "analysis_version": "v4_user_auth_uid"}

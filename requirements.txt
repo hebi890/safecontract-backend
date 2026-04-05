@@ -8,4 +8,4 @@ pytesseract
 pdf2image
 Pillow
 openai
-requests
+firebase-admin==6.8.0
