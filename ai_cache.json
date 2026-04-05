@@ -1,0 +1,22 @@
+{
+  "33a0dabead3908f459235e8df4f1f4015c8082ca9630eab6983f29359dc19e5c": {
+    "summary_simple": "Umowa zawiera ryzyka związane z ograniczeniem odpowiedzialności, niekorzystną jurysdykcją oraz jednostronnymi obowiązkami. To może prowadzić do trudności w dochodzeniu roszczeń i zwiększonych kosztów. Zachowaj ostrożność przed podpisaniem.",
+    "red_flags": [
+      "Ograniczenie odpowiedzialności za szkody.",
+      "Niekorzystna lokalizacja sądu.",
+      "Jednostronne obowiązki płatnicze."
+    ],
+    "negotiation_points": [
+      "Poproś o usunięcie ograniczenia odpowiedzialności za lekką niedbałość.",
+      "Negocjuj korzystniejszą jurysdykcję, bliżej miejsca Twojej działalności.",
+      "Ustal dłuższe terminy płatności i równomierne obowiązki dla obu stron."
+    ],
+    "risk_level": "medium",
+    "ai_explanation": "Umowa zawiera ryzyka związane z ograniczeniem odpowiedzialności, niekorzystną jurysdykcją oraz jednostronnymi obowiązkami. To może prowadzić do trudności w dochodzeniu roszczeń i zwiększonych kosztów. Zachowaj ostrożność przed podpisaniem.\n\nCo to oznacza: Ograniczenie odpowiedzialności oznacza, że druga strona nie bierze odpowiedzialności za błędy. Niekorzystna jurysdykcja może utrudnić rozwiązywanie sporów, a jednostronne obowiązki mogą prowadzić do niekorzystnych warunków płatności.\n\nNajwiększe czerwone flagi: Ograniczenie odpowiedzialności za szkody.; Niekorzystna lokalizacja sądu.; Jednostronne obowiązki płatnicze.\n\nDo negocjacji: Poproś o usunięcie ograniczenia odpowiedzialności za lekką niedbałość.; Negocjuj korzystniejszą jurysdykcję, bliżej miejsca Twojej działalności.; Ustal dłuższe terminy płatności i równomierne obowiązki dla obu stron.",
+    "quick_decision": {
+      "label": "Podpisz ostrożnie",
+      "reason": "Są zapisy wymagające uwagi. Przed podpisaniem sprawdź odpowiedzialność, koszty i warunki zakończenia umowy.",
+      "confidence": 79
+    }
+  }
+}
