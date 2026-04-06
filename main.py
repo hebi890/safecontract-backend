@@ -25,9 +25,6 @@ from ai_service import build_ai_input, call_ai_explain
 from history_routes import router as history_router
 from auth_firebase import init_firebase, CurrentUser, get_current_user
 from user_usage_db import (
-    FREE_LIMIT,
-    can_use_free,
-    get_free_left,
     get_free_used,
     increment_free_used,
     init_user_usage_db,
@@ -271,7 +268,6 @@ def _ocr_pdf(path: str, lang: str = "deu+eng") -> Dict[str, Any]:
 def _repair_pdf(input_path: str) -> str:
     repaired_path = input_path.replace(".pdf", "_repaired.pdf")
 
-    # qpdf
     try:
         subprocess.run(
             ["qpdf", "--repair", input_path, repaired_path],
@@ -285,7 +281,6 @@ def _repair_pdf(input_path: str) -> str:
     except Exception as e:
         print("qpdf repair failed:", e)
 
-    # ghostscript
     gs_cmd = "gswin64c" if os.name == "nt" else "gs"
     try:
         subprocess.run([
@@ -312,7 +307,6 @@ def _extract_text(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".pdf":
-        # 1. normal read
         try:
             text = _read_pdf_text(path)
         except Exception as e:
@@ -327,7 +321,6 @@ def _extract_text(path: str) -> Dict[str, Any]:
                 "extract_method": "pdf_text",
             }
 
-        # 2. repair
         print("⚠️ LOW TEXT → repairing PDF")
         repaired = _repair_pdf(path)
 
@@ -344,7 +337,6 @@ def _extract_text(path: str) -> Dict[str, Any]:
             except Exception as e:
                 print("REPAIR ERROR:", e)
 
-        # 3. OCR
         try:
             print("🔍 OCR attempt")
             ocr = _ocr_pdf(path, lang="pol+eng+deu")
@@ -358,7 +350,6 @@ def _extract_text(path: str) -> Dict[str, Any]:
         except Exception as e:
             print("OCR ERROR:", e)
 
-        # 4. HARD OCR
         try:
             print("🔥 HARD OCR MODE")
             images = convert_from_path(
@@ -383,7 +374,6 @@ def _extract_text(path: str) -> Dict[str, Any]:
         except Exception as e:
             print("HARD OCR FAILED:", e)
 
-        # 5. Never fail hard
         return {
             "text": text or "Nie udało się odczytać dokumentu.",
             "used_ocr": False,
@@ -679,7 +669,7 @@ def analyze_contract_advanced(text: str, doc_locale: str, result_lang: str) -> D
         plain_de="Eine sehr kurze Zahlungsfrist oder einseitige Pflichten können zu deinem Nachteil wirken.",
         plain_en="A very short payment deadline or one-sided obligations may work against you.",
         why_pl="Może to prowadzić do odsetek, blokad, dodatkowych kosztów albo łatwiejszego uznania Cię za stronę naruszającą umowę.",
-        why_de="Das kann zu Zinsen, Sperren, Zusatzkosten oder einem schnelleren Vertragsverstoß auf deiner Seite führen.",
+        why_DE="Das kann zu Zinsen, Sperren, Zusatzkosten oder einem schnelleren Vertragsverstoß auf deiner Seite führen.",
         why_en="This can lead to interest, suspension, extra fees, or quicker default on your side.",
         rec_pl="Sprawdź terminy płatności, odsetki i konsekwencje opóźnienia. Upewnij się, że obowiązki stron są proporcjonalne.",
         rec_de="Prüfe Zahlungsfristen, Zinsen und die Folgen eines Verzugs. Achte darauf, dass die Pflichten beider Seiten ausgewogen sind.",
@@ -1036,21 +1026,25 @@ async def upload_document(
 
     pro = is_pro_user(current_user.uid)
     used_before = get_free_used(current_user.uid)
-    free_left_before = get_free_left(current_user.uid)
+
+    dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
+    free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(
         f"DEBUG uid={current_user.uid} provider={current_user.provider} "
-        f"pro={pro} used={used_before} limit={FREE_LIMIT}"
+        f"is_anonymous={current_user.is_anonymous} "
+        f"pro={pro} used={used_before} limit={dynamic_free_limit}"
     )
 
-    if not pro and not can_use_free(current_user.uid):
+    if not pro and used_before >= dynamic_free_limit:
         raise HTTPException(
             status_code=403,
             detail={
                 "code": "FREE_LIMIT_EXCEEDED",
-                "free_limit": FREE_LIMIT,
+                "free_limit": dynamic_free_limit,
                 "free_used": used_before,
                 "free_left": free_left_before,
+                "is_anonymous": current_user.is_anonymous,
             },
         )
 
@@ -1115,7 +1109,7 @@ async def upload_document(
 
     if not pro:
         free_used_after = increment_free_used(current_user.uid)
-        free_left_after = max(FREE_LIMIT - free_used_after, 0)
+        free_left_after = max(dynamic_free_limit - free_used_after, 0)
 
     response = {
         "analysis_id": str(uuid.uuid4()),
@@ -1133,11 +1127,12 @@ async def upload_document(
         "text_sample": text[:3000],
         "ai_enabled": pro and wants_ai,
         "ai_explanation": analysis.get("ai_explanation", ""),
-        "free_limit": FREE_LIMIT,
+        "free_limit": dynamic_free_limit,
         "free_used_before": used_before,
         "free_left_before": free_left_before,
         "free_used_after": free_used_after,
         "free_left_after": free_left_after,
+        "is_anonymous": current_user.is_anonymous,
         **analysis,
     }
 
@@ -1147,3 +1142,4 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
+
