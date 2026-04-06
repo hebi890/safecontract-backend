@@ -4,6 +4,7 @@ import json
 import uuid
 import shutil
 import hashlib
+import subprocess
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Depends
@@ -209,8 +210,9 @@ def _read_pdf_text(path: str) -> str:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
                 text += "\n" + (page.extract_text() or "")
-    except Exception:
-        pass
+    except Exception as e:
+        print("PDF READ ERROR:", e)
+        return ""
     return text.strip()
 
 
@@ -219,7 +221,7 @@ def _read_docx_text(path: str) -> str:
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
 
-def _ocr_pdf(path: str) -> Dict[str, Any]:
+def _ocr_pdf(path: str, lang: str = "deu+eng") -> Dict[str, Any]:
     result = {
         "text": "",
         "used_ocr": False,
@@ -227,19 +229,19 @@ def _ocr_pdf(path: str) -> Dict[str, Any]:
         "extract_method": "text",
     }
 
-    if not os.path.exists(TESSERACT_CMD):
+    if os.name == "nt" and not os.path.exists(TESSERACT_CMD):
         return result
 
     try:
         images = convert_from_path(
             path,
-            poppler_path=POPPLER_PATH if os.path.exists(POPPLER_PATH) else None,
+            poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
         )
         page_texts: List[str] = []
         confs: List[float] = []
 
         for img in images:
-            data = pytesseract.image_to_data(img, output_type=Output.DICT, lang="deu+eng")
+            data = pytesseract.image_to_data(img, output_type=Output.DICT, lang=lang)
             words = []
             for i, raw in enumerate(data.get("text", [])):
                 token = (raw or "").strip()
@@ -260,18 +262,64 @@ def _ocr_pdf(path: str) -> Dict[str, Any]:
             result["extract_method"] = "ocr"
             if confs:
                 result["ocr_avg_conf"] = round(sum(confs) / len(confs), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        print("OCR ERROR:", e)
 
     return result
+
+
+def _repair_pdf(input_path: str) -> str:
+    repaired_path = input_path.replace(".pdf", "_repaired.pdf")
+
+    # qpdf
+    try:
+        subprocess.run(
+            ["qpdf", "--repair", input_path, repaired_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(repaired_path) and os.path.getsize(repaired_path) > 0:
+            print("✅ qpdf repair OK")
+            return repaired_path
+    except Exception as e:
+        print("qpdf repair failed:", e)
+
+    # ghostscript
+    gs_cmd = "gswin64c" if os.name == "nt" else "gs"
+    try:
+        subprocess.run([
+            gs_cmd,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={repaired_path}",
+            input_path,
+        ], check=True)
+
+        if os.path.exists(repaired_path) and os.path.getsize(repaired_path) > 0:
+            print("✅ ghostscript repair OK")
+            return repaired_path
+    except Exception as e:
+        print("ghostscript repair failed:", e)
+
+    return input_path
 
 
 def _extract_text(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".pdf":
-        text = _read_pdf_text(path)
-        if text:
+        # 1. normal read
+        try:
+            text = _read_pdf_text(path)
+        except Exception as e:
+            print("PDF READ ERROR:", e)
+            text = ""
+
+        if len(text) >= 300:
             return {
                 "text": text,
                 "used_ocr": False,
@@ -279,15 +327,68 @@ def _extract_text(path: str) -> Dict[str, Any]:
                 "extract_method": "pdf_text",
             }
 
-        ocr = _ocr_pdf(path)
-        if ocr["text"]:
-            return ocr
+        # 2. repair
+        print("⚠️ LOW TEXT → repairing PDF")
+        repaired = _repair_pdf(path)
 
+        if repaired != path:
+            try:
+                text = _read_pdf_text(repaired)
+                if len(text) >= 300:
+                    return {
+                        "text": text,
+                        "used_ocr": False,
+                        "ocr_avg_conf": None,
+                        "extract_method": "repaired_pdf",
+                    }
+            except Exception as e:
+                print("REPAIR ERROR:", e)
+
+        # 3. OCR
+        try:
+            print("🔍 OCR attempt")
+            ocr = _ocr_pdf(path, lang="pol+eng+deu")
+            if ocr["text"]:
+                return {
+                    "text": ocr["text"],
+                    "used_ocr": True,
+                    "ocr_avg_conf": ocr.get("ocr_avg_conf"),
+                    "extract_method": "ocr",
+                }
+        except Exception as e:
+            print("OCR ERROR:", e)
+
+        # 4. HARD OCR
+        try:
+            print("🔥 HARD OCR MODE")
+            images = convert_from_path(
+                path,
+                dpi=300,
+                poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
+            )
+            full_text = []
+
+            for img in images:
+                txt = pytesseract.image_to_string(img, lang="pol+eng+deu")
+                full_text.append(txt)
+
+            hard_text = "\n".join(full_text).strip()
+            if hard_text:
+                return {
+                    "text": hard_text,
+                    "used_ocr": True,
+                    "ocr_avg_conf": None,
+                    "extract_method": "hard_ocr",
+                }
+        except Exception as e:
+            print("HARD OCR FAILED:", e)
+
+        # 5. Never fail hard
         return {
-            "text": "",
+            "text": text or "Nie udało się odczytać dokumentu.",
             "used_ocr": False,
             "ocr_avg_conf": None,
-            "extract_method": "pdf_text_empty",
+            "extract_method": "fallback",
         }
 
     if ext == ".docx":
@@ -1045,4 +1146,4 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v4_user_auth_uid"}
+    return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
