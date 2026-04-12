@@ -1027,7 +1027,7 @@ async def upload_document(
     pro = is_pro_user(current_user.uid)
     used_before = get_free_used(current_user.uid)
 
-    dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
+    dynamic_free_limit = 999999 if pro else 2
     free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(

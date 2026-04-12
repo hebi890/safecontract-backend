@@ -13,9 +13,9 @@ def pro_status(current_user: CurrentUser = Depends(get_current_user)):
     used = get_free_used(current_user.uid)
 
     if is_pro:
-        free_limit = 999999
-    else:
-        free_limit = 1 if current_user.is_anonymous else 2
+    free_limit = 999999
+else:
+    free_limit = 2
 
     free_left = max(free_limit - used, 0)
 
