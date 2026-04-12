@@ -669,7 +669,7 @@ def analyze_contract_advanced(text: str, doc_locale: str, result_lang: str) -> D
         plain_de="Eine sehr kurze Zahlungsfrist oder einseitige Pflichten können zu deinem Nachteil wirken.",
         plain_en="A very short payment deadline or one-sided obligations may work against you.",
         why_pl="Może to prowadzić do odsetek, blokad, dodatkowych kosztów albo łatwiejszego uznania Cię za stronę naruszającą umowę.",
-        why_DE="Das kann zu Zinsen, Sperren, Zusatzkosten oder einem schnelleren Vertragsverstoß auf deiner Seite führen.",
+        why_de="Das kann zu Zinsen, Sperren, Zusatzkosten oder einem schnelleren Vertragsverstoß auf deiner Seite führen.",
         why_en="This can lead to interest, suspension, extra fees, or quicker default on your side.",
         rec_pl="Sprawdź terminy płatności, odsetki i konsekwencje opóźnienia. Upewnij się, że obowiązki stron są proporcjonalne.",
         rec_de="Prüfe Zahlungsfristen, Zinsen und die Folgen eines Verzugs. Achte darauf, dass die Pflichten beider Seiten ausgewogen sind.",
