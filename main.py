@@ -30,7 +30,7 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import init_pro_user_db, is_pro_user
+from pro_user_db import get_trial_until, init_pro_user_db, is_pro_user, start_trial
 from pro_routes_uid import router as pro_router
 
 import PyPDF2
@@ -1027,13 +1027,22 @@ async def upload_document(
     pro = is_pro_user(current_user.uid)
     used_before = get_free_used(current_user.uid)
 
+    trial_started_now = False
+    if not pro and used_before == 0:
+        trial_result = start_trial(current_user.uid, days=3, source="auto_first_analysis")
+        trial_started_now = bool(trial_result.get("started"))
+        pro = is_pro_user(current_user.uid)
+
+    trial_until = get_trial_until(current_user.uid)
+    is_trial_active = bool(trial_until and pro)
+
     dynamic_free_limit = 999999 if pro else 2
     free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(
         f"DEBUG uid={current_user.uid} provider={current_user.provider} "
         f"is_anonymous={current_user.is_anonymous} "
-        f"pro={pro} used={used_before} limit={dynamic_free_limit}"
+        f"pro={pro} used={used_before} trial_until={trial_until} limit={dynamic_free_limit}"
     )
 
     if not pro and used_before >= dynamic_free_limit:
@@ -1120,6 +1129,9 @@ async def upload_document(
         "doc_locale": doc_locale,
         "result_lang": result_lang,
         "analysis_mode": mode,
+        "trial_started_now": trial_started_now,
+        "trial_until": trial_until,
+        "is_trial_active": is_trial_active,
         "used_ocr": extraction["used_ocr"],
         "extract_method": extraction["extract_method"],
         "ocr_avg_conf": extraction["ocr_avg_conf"],
