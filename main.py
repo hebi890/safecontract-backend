@@ -30,7 +30,7 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import get_trial_until, init_pro_user_db, is_pro_user, start_trial
+from pro_user_db import get_pro_record, get_trial_until, init_pro_user_db, is_pro_user, start_trial
 from pro_routes_uid import router as pro_router
 
 import PyPDF2
@@ -1028,13 +1028,9 @@ async def upload_document(
     used_before = get_free_used(current_user.uid)
 
     trial_started_now = False
-    if not pro and used_before == 0:
-        trial_result = start_trial(current_user.uid, days=3, source="auto_first_analysis")
-        trial_started_now = bool(trial_result.get("started"))
-        pro = is_pro_user(current_user.uid)
-
     trial_until = get_trial_until(current_user.uid)
-    is_trial_active = bool(trial_until and pro)
+    trial_record = get_pro_record(current_user.uid)
+    is_trial_active = bool(trial_record.get("trial_active"))
 
     dynamic_free_limit = 999999 if pro else 2
     free_left_before = max(dynamic_free_limit - used_before, 0)
@@ -1085,6 +1081,19 @@ async def upload_document(
     doc_locale = choose_doc_locale(text)
     analysis_raw = analyze_contract_advanced(text, doc_locale, result_lang)
     analysis = normalize_analysis(analysis_raw, result_lang)
+
+    if not pro and used_before == 0:
+        trial_result = start_trial(current_user.uid, days=3, source="auto_first_analysis")
+        trial_started_now = bool(trial_result.get("started"))
+        pro = is_pro_user(current_user.uid)
+        trial_until = get_trial_until(current_user.uid)
+        trial_record = get_pro_record(current_user.uid)
+        is_trial_active = bool(trial_record.get("trial_active"))
+        dynamic_free_limit = 999999 if pro else 2
+        free_left_before = max(dynamic_free_limit - used_before, 0)
+
+        if trial_started_now:
+            print(f"🔥 TRIAL STARTED uid={current_user.uid} until={trial_until}")
 
     wants_ai = str(ai).lower() == "true"
 
@@ -1154,4 +1163,5 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
+
 
