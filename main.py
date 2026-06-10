@@ -1218,4 +1218,3 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
-
