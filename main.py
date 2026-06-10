@@ -30,7 +30,7 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import get_pro_record, get_trial_until, init_pro_user_db, is_pro_user, start_trial
+from pro_user_db import init_pro_user_db, is_pro_user
 from pro_routes_uid import router as pro_router
 
 import PyPDF2
@@ -198,6 +198,69 @@ def choose_doc_locale(text: str) -> str:
     if en_score >= pl_score and en_score > 0:
         return "en"
     return "pl"
+
+
+LEGAL_DOC_KEYWORDS = [
+    # PL
+    r"\bumowa\b", r"\bstron(?:a|y|ami)?\b", r"\bzleceni(?:e|a|obiorca|odawca)\b",
+    r"\bkontrahent\b", r"\bregulamin\b", r"\bwarunki\b", r"\bodpowiedzialno", r"\bwypowiedze",
+    r"\bodstąpien", r"\bkara umowna\b", r"\bświadczen", r"\bzobowiąz",
+    r"\bwynajm", r"\bnajem\b", r"\bpłatno", r"\bfaktura\b", r"\btermin\b",
+    # DE
+    r"\bvertrag\b", r"\bvertragsparte", r"\bauftrag", r"\bagb\b",
+    r"allgemeine geschäftsbedingungen", r"\bbedingungen\b", r"\bhaftung\b",
+    r"\bkündigung\b", r"\bwiderruf\b", r"\bgerichtsstand\b", r"\blaufzeit\b",
+    r"\bverlängerung\b", r"\bzahlung\b", r"\brechnung\b", r"\bfrist\b",
+    # EN
+    r"\bagreement\b", r"\bcontract\b", r"\bparty\b", r"\bparties\b",
+    r"terms and conditions", r"\bliability\b", r"\btermination\b", r"\bgoverning law\b",
+    r"\bjurisdiction\b", r"\bpayment\b", r"\binvoice\b", r"\bnotice period\b",
+]
+
+NON_CONTRACT_HINTS = [
+    r"\bmenu\b", r"\brecipe\b", r"\bparagon\b", r"\breceipt\b", r"\bshopping list\b",
+    r"\bselfie\b", r"\bphoto\b", r"\bobraz\b", r"\bzdjęcie\b", r"\bbild\b",
+]
+
+
+def looks_like_legal_document(text: str) -> bool:
+    """Reject random photos / OCR garbage before building a report."""
+    raw = text or ""
+    compact = re.sub(r"\s+", " ", raw).strip().lower()
+    alnum_len = len(re.sub(r"[^0-9a-ząćęłńóśźżäöüß]+", "", compact, flags=re.IGNORECASE))
+
+    if not compact or compact == "nie udało się odczytać dokumentu.":
+        return False
+
+    keyword_hits = sum(1 for pattern in LEGAL_DOC_KEYWORDS if re.search(pattern, compact, re.IGNORECASE))
+    non_contract_hits = sum(1 for pattern in NON_CONTRACT_HINTS if re.search(pattern, compact, re.IGNORECASE))
+
+    structure_hits = 0
+    if re.search(r"\b(§|art\.|ust\.|pkt\.|punkt|clause|section)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+    if re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", compact):
+        structure_hits += 1
+    if re.search(r"\b(€|eur|pln|zł|netto|brutto|vat|mwst)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+    if re.search(r"\b(podpis|signature|unterschrift)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+
+    # Bardzo krótki OCR z losowego zdjęcia nie powinien generować raportu.
+    if alnum_len < 300:
+        return keyword_hits >= 3 and structure_hits >= 1
+
+    # Normalny dokument: wymagamy realnych sygnałów prawno-umownych.
+    if keyword_hits >= 2:
+        return True
+
+    # Długi dokument bez słowa "umowa/vertrag/contract", ale ze strukturą klauzul.
+    if alnum_len >= 900 and keyword_hits >= 1 and structure_hits >= 2:
+        return True
+
+    if non_contract_hits > 0 and keyword_hits == 0:
+        return False
+
+    return False
 
 
 def _read_pdf_text(path: str) -> str:
@@ -1027,18 +1090,13 @@ async def upload_document(
     pro = is_pro_user(current_user.uid)
     used_before = get_free_used(current_user.uid)
 
-    trial_started_now = False
-    trial_until = get_trial_until(current_user.uid)
-    trial_record = get_pro_record(current_user.uid)
-    is_trial_active = bool(trial_record.get("trial_active"))
-
-    dynamic_free_limit = 999999 if pro else 2
+    dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
     free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(
         f"DEBUG uid={current_user.uid} provider={current_user.provider} "
         f"is_anonymous={current_user.is_anonymous} "
-        f"pro={pro} used={used_before} trial_until={trial_until} limit={dynamic_free_limit}"
+        f"pro={pro} used={used_before} limit={dynamic_free_limit}"
     )
 
     if not pro and used_before >= dynamic_free_limit:
@@ -1066,34 +1124,34 @@ async def upload_document(
     extraction = _extract_text(path)
     text = extraction["text"] or ""
 
-    if not text.strip():
+    if not text.strip() or extraction.get("extract_method") == "fallback":
         return JSONResponse(
             status_code=400,
             content={
                 "error": "NO_TEXT_EXTRACTED",
-                "message": "Could not extract readable text from file",
+                "message": "Nie udało się odczytać tekstu dokumentu. Wgraj czytelny PDF albo DOCX z umową.",
                 "filename": file.filename,
                 "extract_method": extraction.get("extract_method"),
                 "used_ocr": extraction.get("used_ocr"),
             },
         )
 
+    if not looks_like_legal_document(text):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "NOT_CONTRACT_DOCUMENT",
+                "message": "Ten plik nie wygląda jak umowa, regulamin ani dokument prawny. Wgraj właściwy dokument PDF/DOCX.",
+                "filename": file.filename,
+                "extract_method": extraction.get("extract_method"),
+                "used_ocr": extraction.get("used_ocr"),
+                "text_len": len(text),
+            },
+        )
+
     doc_locale = choose_doc_locale(text)
     analysis_raw = analyze_contract_advanced(text, doc_locale, result_lang)
     analysis = normalize_analysis(analysis_raw, result_lang)
-
-    if not pro and used_before == 0:
-        trial_result = start_trial(current_user.uid, days=3, source="auto_first_analysis")
-        trial_started_now = bool(trial_result.get("started"))
-        pro = is_pro_user(current_user.uid)
-        trial_until = get_trial_until(current_user.uid)
-        trial_record = get_pro_record(current_user.uid)
-        is_trial_active = bool(trial_record.get("trial_active"))
-        dynamic_free_limit = 999999 if pro else 2
-        free_left_before = max(dynamic_free_limit - used_before, 0)
-
-        if trial_started_now:
-            print(f"🔥 TRIAL STARTED uid={current_user.uid} until={trial_until}")
 
     wants_ai = str(ai).lower() == "true"
 
@@ -1138,9 +1196,6 @@ async def upload_document(
         "doc_locale": doc_locale,
         "result_lang": result_lang,
         "analysis_mode": mode,
-        "trial_started_now": trial_started_now,
-        "trial_until": trial_until,
-        "is_trial_active": is_trial_active,
         "used_ocr": extraction["used_ocr"],
         "extract_method": extraction["extract_method"],
         "ocr_avg_conf": extraction["ocr_avg_conf"],
@@ -1163,5 +1218,4 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
-
 
