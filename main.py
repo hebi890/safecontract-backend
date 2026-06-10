@@ -245,6 +245,12 @@ def looks_like_legal_document(text: str) -> bool:
     if re.search(r"\b(podpis|signature|unterschrift)\b", compact, re.IGNORECASE):
         structure_hits += 1
 
+    print(f"📄 LEGAL FILTER alnum={alnum_len} keywords={keyword_hits} structure={structure_hits} non_contract={non_contract_hits}")
+
+    # Dodatkowo przepuszczamy typowe krótkie skany umów, np. jedna strona z paragrafami i podpisami.
+    if keyword_hits >= 1 and structure_hits >= 2 and alnum_len >= 180:
+        return True
+
     # Bardzo krótki OCR z losowego zdjęcia nie powinien generować raportu.
     if alnum_len < 300:
         return keyword_hits >= 3 and structure_hits >= 1
@@ -281,6 +287,102 @@ def _read_docx_text(path: str) -> str:
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
 
+def _ocr_image_best_effort(img, lang: str = "pol+eng+deu") -> Dict[str, Any]:
+    """OCR one page in 4 rotations and return best text/conf."""
+    best_text = ""
+    best_conf = -1.0
+    best_rotation = 0
+    all_confs: List[float] = []
+
+    for rotation in [0, 90, 180, 270]:
+        try:
+            rotated = img.rotate(rotation, expand=True) if rotation else img
+            data = pytesseract.image_to_data(rotated, output_type=Output.DICT, lang=lang)
+
+            words: List[str] = []
+            confs: List[float] = []
+
+            for i, raw in enumerate(data.get("text", [])):
+                token = (raw or "").strip()
+                if token:
+                    words.append(token)
+                try:
+                    conf = float(data.get("conf", [])[i])
+                    if conf >= 0:
+                        confs.append(conf)
+                        all_confs.append(conf)
+                except Exception:
+                    pass
+
+            page_text = " ".join(words).strip()
+            avg_conf = (sum(confs) / len(confs)) if confs else 0.0
+
+            # Prefer longer text, then confidence. This helps with sideways scans.
+            score = (len(re.sub(r"\s+", "", page_text)) * 1.0) + (avg_conf * 3.0)
+
+            current_best_score = (len(re.sub(r"\s+", "", best_text)) * 1.0) + (best_conf * 3.0)
+            if page_text and score > current_best_score:
+                best_text = page_text
+                best_conf = avg_conf
+                best_rotation = rotation
+        except Exception as e:
+            print(f"OCR ROTATION {rotation} ERROR:", e)
+
+    print(f"🔁 OCR best rotation={best_rotation} conf={round(best_conf, 2) if best_conf >= 0 else None} len={len(best_text)}")
+
+    return {
+        "text": best_text,
+        "avg_conf": round(best_conf, 2) if best_conf >= 0 else None,
+        "rotation": best_rotation,
+        "all_confs": all_confs,
+    }
+
+
+def _ocr_pdf_rotations(path: str, lang: str = "pol+eng+deu", dpi: int = 300) -> Dict[str, Any]:
+    result = {
+        "text": "",
+        "used_ocr": False,
+        "ocr_avg_conf": None,
+        "extract_method": "ocr_rotations",
+        "ocr_rotation": None,
+    }
+
+    try:
+        images = convert_from_path(
+            path,
+            dpi=dpi,
+            poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
+        )
+
+        page_texts: List[str] = []
+        confs: List[float] = []
+        rotations: List[int] = []
+
+        for img in images:
+            best = _ocr_image_best_effort(img, lang=lang)
+            if best.get("text"):
+                page_texts.append(str(best["text"]))
+            if best.get("avg_conf") is not None:
+                confs.append(float(best["avg_conf"]))
+            if best.get("rotation") is not None:
+                rotations.append(int(best["rotation"]))
+
+        full_text = "\n".join(page_texts).strip()
+        if full_text:
+            result["text"] = full_text
+            result["used_ocr"] = True
+            result["extract_method"] = "ocr_rotations"
+            if confs:
+                result["ocr_avg_conf"] = round(sum(confs) / len(confs), 2)
+            if rotations:
+                result["ocr_rotation"] = max(set(rotations), key=rotations.count)
+
+    except Exception as e:
+        print("OCR ROTATIONS FAILED:", e)
+
+    return result
+
+
 def _ocr_pdf(path: str, lang: str = "deu+eng") -> Dict[str, Any]:
     result = {
         "text": "",
@@ -292,9 +394,15 @@ def _ocr_pdf(path: str, lang: str = "deu+eng") -> Dict[str, Any]:
     if os.name == "nt" and not os.path.exists(TESSERACT_CMD):
         return result
 
+    # First try rotation-aware OCR. This is critical for sideways phone scans.
+    rotated = _ocr_pdf_rotations(path, lang=lang, dpi=300)
+    if rotated.get("text"):
+        return rotated
+
     try:
         images = convert_from_path(
             path,
+            dpi=300,
             poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
         )
         page_texts: List[str] = []
@@ -415,24 +523,14 @@ def _extract_text(path: str) -> Dict[str, Any]:
 
         try:
             print("🔥 HARD OCR MODE")
-            images = convert_from_path(
-                path,
-                dpi=300,
-                poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
-            )
-            full_text = []
-
-            for img in images:
-                txt = pytesseract.image_to_string(img, lang="pol+eng+deu")
-                full_text.append(txt)
-
-            hard_text = "\n".join(full_text).strip()
+            hard = _ocr_pdf_rotations(path, lang="pol+eng+deu", dpi=350)
+            hard_text = str(hard.get("text") or "").strip()
             if hard_text:
                 return {
                     "text": hard_text,
                     "used_ocr": True,
-                    "ocr_avg_conf": None,
-                    "extract_method": "hard_ocr",
+                    "ocr_avg_conf": hard.get("ocr_avg_conf"),
+                    "extract_method": "hard_ocr_rotations",
                 }
         except Exception as e:
             print("HARD OCR FAILED:", e)
@@ -1124,6 +1222,12 @@ async def upload_document(
     extraction = _extract_text(path)
     text = extraction["text"] or ""
 
+    print("📄 EXTRACT METHOD:", extraction.get("extract_method"))
+    print("📄 USED OCR:", extraction.get("used_ocr"))
+    print("📄 OCR AVG CONF:", extraction.get("ocr_avg_conf"))
+    print("📄 TEXT LEN:", len(text))
+    print("📄 TEXT SAMPLE:", re.sub(r"\\s+", " ", text[:1000]))
+
     if not text.strip() or extraction.get("extract_method") == "fallback":
         return JSONResponse(
             status_code=400,
@@ -1137,6 +1241,7 @@ async def upload_document(
         )
 
     if not looks_like_legal_document(text):
+        print("❌ NOT CONTRACT SAMPLE:", re.sub(r"\\s+", " ", text[:1500]))
         return JSONResponse(
             status_code=400,
             content={
