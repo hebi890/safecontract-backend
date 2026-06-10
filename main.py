@@ -30,7 +30,7 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import get_pro_record, get_trial_until, init_pro_user_db, is_pro_user, start_trial
+from pro_user_db import init_pro_user_db, is_pro_user
 from pro_routes_uid import router as pro_router
 
 import PyPDF2
@@ -172,93 +172,6 @@ def store_cached_ai(cache_key: str, payload: Dict[str, Any]) -> None:
     _save_ai_cache(cache)
 
 
-
-
-def _clean_text_for_validation(text: str) -> str:
-    txt = (text or "").lower()
-    txt = re.sub(r"\s+", " ", txt)
-    return txt.strip()
-
-
-def contract_likeness_score(text: str) -> int:
-    """
-    Łagodna walidacja: przepuszcza umowy, AGB/regulaminy, zlecenia,
-    najem, dokumenty prawne i skany OCR. Blokuje typowe zdjęcia/śmieci.
-    """
-    txt = _clean_text_for_validation(text)
-    if not txt:
-        return 0
-
-    score = 0
-
-    if len(txt) >= 250:
-        score += 2
-    if len(txt) >= 600:
-        score += 2
-    if len(txt) >= 1200:
-        score += 2
-
-    strong_terms = [
-        "umowa", "zleceniodawca", "zleceniobiorca", "zlecenia", "wykonawca",
-        "zamawiający", "najemca", "wynajmujący", "regulamin", "warunki umowy",
-        "kara umowna", "wypowiedzenie", "odstąpienia", "odstąpienie",
-        "odpowiedzialność", "świadczenie", "zobowiązuje się", "strony umowy",
-        "paragraf", "§", "kodeks cywilny",
-        "vertrag", "auftraggeber", "auftragnehmer", "mieter", "vermieter",
-        "kündigung", "haftung", "agb", "allgemeine geschäftsbedingungen",
-        "vertragsstrafe", "gerichtsstand", "vereinbarung", "widerruf",
-        "agreement", "contract", "terms and conditions", "party", "parties",
-        "liability", "termination", "governing law", "jurisdiction",
-    ]
-
-    medium_terms = [
-        "kwota", "płatność", "wynagrodzenie", "termin", "obowiązek",
-        "obowiązków", "naruszenie", "szkoda", "zapłaty", "należytego",
-        "notice", "payment", "fee", "penalty", "invoice", "damages",
-        "zahlung", "frist", "pflicht", "schaden", "rechnung",
-    ]
-
-    score += sum(3 for term in strong_terms if term in txt)
-    score += sum(1 for term in medium_terms if term in txt)
-
-    if re.search(r"(§|art\.|ust\.|pkt\.|section|clause|paragraph)\s*\d+", txt):
-        score += 4
-    if re.search(r"\b\d{1,2}\s*(dni|days|tage|miesi[eę]cy|months|monate)\b", txt):
-        score += 2
-    if re.search(r"\b\d+[\s.,]*(zł|pln|eur|€)\b", txt):
-        score += 2
-
-    return score
-
-
-def is_probably_contract_document(text: str) -> bool:
-    txt = _clean_text_for_validation(text)
-
-    if len(txt) < 120:
-        return False
-    if "nie udało się odczytać dokumentu" in txt:
-        return False
-
-    return contract_likeness_score(txt) >= 6
-
-
-def document_rejection_message(result_lang: str) -> str:
-    return t(
-        result_lang,
-        "Ten plik nie wygląda jak umowa, regulamin ani dokument prawny. Dodaj wyraźny skan/PDF umowy.",
-        "Diese Datei sieht nicht wie ein Vertrag, AGB oder ein Rechtsdokument aus. Bitte lade einen klaren Scan/eine PDF eines Vertrags hoch.",
-        "This file does not look like a contract, terms document, or legal document. Please upload a clear contract scan/PDF.",
-    )
-
-
-def _ocr_text_quality_score(text: str) -> int:
-    txt = _clean_text_for_validation(text)
-    if not txt:
-        return 0
-    words = re.findall(r"[a-ząćęłńóśźżäöüß]{3,}", txt, flags=re.IGNORECASE)
-    return len(words) + contract_likeness_score(txt) * 10
-
-
 def choose_doc_locale(text: str) -> str:
     txt = (text or "").lower()
 
@@ -285,6 +198,69 @@ def choose_doc_locale(text: str) -> str:
     if en_score >= pl_score and en_score > 0:
         return "en"
     return "pl"
+
+
+LEGAL_DOC_KEYWORDS = [
+    # PL
+    r"\bumowa\b", r"\bstron(?:a|y|ami)?\b", r"\bzleceni(?:e|a|obiorca|odawca)\b",
+    r"\bkontrahent\b", r"\bregulamin\b", r"\bwarunki\b", r"\bodpowiedzialno", r"\bwypowiedze",
+    r"\bodstąpien", r"\bkara umowna\b", r"\bświadczen", r"\bzobowiąz",
+    r"\bwynajm", r"\bnajem\b", r"\bpłatno", r"\bfaktura\b", r"\btermin\b",
+    # DE
+    r"\bvertrag\b", r"\bvertragsparte", r"\bauftrag", r"\bagb\b",
+    r"allgemeine geschäftsbedingungen", r"\bbedingungen\b", r"\bhaftung\b",
+    r"\bkündigung\b", r"\bwiderruf\b", r"\bgerichtsstand\b", r"\blaufzeit\b",
+    r"\bverlängerung\b", r"\bzahlung\b", r"\brechnung\b", r"\bfrist\b",
+    # EN
+    r"\bagreement\b", r"\bcontract\b", r"\bparty\b", r"\bparties\b",
+    r"terms and conditions", r"\bliability\b", r"\btermination\b", r"\bgoverning law\b",
+    r"\bjurisdiction\b", r"\bpayment\b", r"\binvoice\b", r"\bnotice period\b",
+]
+
+NON_CONTRACT_HINTS = [
+    r"\bmenu\b", r"\brecipe\b", r"\bparagon\b", r"\breceipt\b", r"\bshopping list\b",
+    r"\bselfie\b", r"\bphoto\b", r"\bobraz\b", r"\bzdjęcie\b", r"\bbild\b",
+]
+
+
+def looks_like_legal_document(text: str) -> bool:
+    """Reject random photos / OCR garbage before building a report."""
+    raw = text or ""
+    compact = re.sub(r"\s+", " ", raw).strip().lower()
+    alnum_len = len(re.sub(r"[^0-9a-ząćęłńóśźżäöüß]+", "", compact, flags=re.IGNORECASE))
+
+    if not compact or compact == "nie udało się odczytać dokumentu.":
+        return False
+
+    keyword_hits = sum(1 for pattern in LEGAL_DOC_KEYWORDS if re.search(pattern, compact, re.IGNORECASE))
+    non_contract_hits = sum(1 for pattern in NON_CONTRACT_HINTS if re.search(pattern, compact, re.IGNORECASE))
+
+    structure_hits = 0
+    if re.search(r"\b(§|art\.|ust\.|pkt\.|punkt|clause|section)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+    if re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", compact):
+        structure_hits += 1
+    if re.search(r"\b(€|eur|pln|zł|netto|brutto|vat|mwst)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+    if re.search(r"\b(podpis|signature|unterschrift)\b", compact, re.IGNORECASE):
+        structure_hits += 1
+
+    # Bardzo krótki OCR z losowego zdjęcia nie powinien generować raportu.
+    if alnum_len < 300:
+        return keyword_hits >= 3 and structure_hits >= 1
+
+    # Normalny dokument: wymagamy realnych sygnałów prawno-umownych.
+    if keyword_hits >= 2:
+        return True
+
+    # Długi dokument bez słowa "umowa/vertrag/contract", ale ze strukturą klauzul.
+    if alnum_len >= 900 and keyword_hits >= 1 and structure_hits >= 2:
+        return True
+
+    if non_contract_hits > 0 and keyword_hits == 0:
+        return False
+
+    return False
 
 
 def _read_pdf_text(path: str) -> str:
@@ -319,61 +295,38 @@ def _ocr_pdf(path: str, lang: str = "deu+eng") -> Dict[str, Any]:
     try:
         images = convert_from_path(
             path,
-            dpi=300,
             poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
         )
+        page_texts: List[str] = []
+        confs: List[float] = []
 
-        best_text = ""
-        best_confs: List[float] = []
-        best_rotation = 0
-        best_score = -1
+        for img in images:
+            data = pytesseract.image_to_data(img, output_type=Output.DICT, lang=lang)
+            words = []
+            for i, raw in enumerate(data.get("text", [])):
+                token = (raw or "").strip()
+                if token:
+                    words.append(token)
+                try:
+                    conf = float(data.get("conf", [])[i])
+                    if conf >= 0:
+                        confs.append(conf)
+                except Exception:
+                    pass
+            page_texts.append(" ".join(words))
 
-        for rotation in [0, 90, 180, 270]:
-            page_texts: List[str] = []
-            confs: List[float] = []
-
-            for img in images:
-                rotated = img.rotate(rotation, expand=True) if rotation else img
-                data = pytesseract.image_to_data(rotated, output_type=Output.DICT, lang=lang)
-
-                words = []
-                texts = data.get("text", [])
-                conf_values = data.get("conf", [])
-
-                for i, raw in enumerate(texts):
-                    token = (raw or "").strip()
-                    if token:
-                        words.append(token)
-                    try:
-                        conf = float(conf_values[i])
-                        if conf >= 0:
-                            confs.append(conf)
-                    except Exception:
-                        pass
-
-                page_texts.append(" ".join(words))
-
-            candidate = "\n".join(page_texts).strip()
-            score = _ocr_text_quality_score(candidate)
-            print(f"OCR rotation={rotation} score={score} len={len(candidate)}")
-
-            if score > best_score:
-                best_score = score
-                best_text = candidate
-                best_confs = confs
-                best_rotation = rotation
-
-        if best_text:
-            result["text"] = best_text
+        text = "\n".join(page_texts).strip()
+        if text:
+            result["text"] = text
             result["used_ocr"] = True
-            result["extract_method"] = "ocr" if best_rotation == 0 else f"ocr_rotated_{best_rotation}"
-            if best_confs:
-                result["ocr_avg_conf"] = round(sum(best_confs) / len(best_confs), 2)
-
+            result["extract_method"] = "ocr"
+            if confs:
+                result["ocr_avg_conf"] = round(sum(confs) / len(confs), 2)
     except Exception as e:
         print("OCR ERROR:", e)
 
     return result
+
 
 def _repair_pdf(input_path: str) -> str:
     repaired_path = input_path.replace(".pdf", "_repaired.pdf")
@@ -467,33 +420,19 @@ def _extract_text(path: str) -> Dict[str, Any]:
                 dpi=300,
                 poppler_path=POPPLER_PATH if (os.name == "nt" and os.path.exists(POPPLER_PATH)) else None,
             )
+            full_text = []
 
-            best_text = ""
-            best_rotation = 0
-            best_score = -1
+            for img in images:
+                txt = pytesseract.image_to_string(img, lang="pol+eng+deu")
+                full_text.append(txt)
 
-            for rotation in [0, 90, 180, 270]:
-                full_text = []
-                for img in images:
-                    rotated = img.rotate(rotation, expand=True) if rotation else img
-                    txt = pytesseract.image_to_string(rotated, lang="pol+eng+deu")
-                    full_text.append(txt)
-
-                candidate = "\n".join(full_text).strip()
-                score = _ocr_text_quality_score(candidate)
-                print(f"HARD OCR rotation={rotation} score={score} len={len(candidate)}")
-
-                if score > best_score:
-                    best_score = score
-                    best_text = candidate
-                    best_rotation = rotation
-
-            if best_text:
+            hard_text = "\n".join(full_text).strip()
+            if hard_text:
                 return {
-                    "text": best_text,
+                    "text": hard_text,
                     "used_ocr": True,
                     "ocr_avg_conf": None,
-                    "extract_method": "hard_ocr" if best_rotation == 0 else f"hard_ocr_rotated_{best_rotation}",
+                    "extract_method": "hard_ocr",
                 }
         except Exception as e:
             print("HARD OCR FAILED:", e)
@@ -1151,18 +1090,13 @@ async def upload_document(
     pro = is_pro_user(current_user.uid)
     used_before = get_free_used(current_user.uid)
 
-    trial_started_now = False
-    trial_until = get_trial_until(current_user.uid)
-    trial_record = get_pro_record(current_user.uid)
-    is_trial_active = bool(trial_record.get("trial_active"))
-
-    dynamic_free_limit = 999999 if pro else 2
+    dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
     free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(
         f"DEBUG uid={current_user.uid} provider={current_user.provider} "
         f"is_anonymous={current_user.is_anonymous} "
-        f"pro={pro} used={used_before} trial_until={trial_until} limit={dynamic_free_limit}"
+        f"pro={pro} used={used_before} limit={dynamic_free_limit}"
     )
 
     if not pro and used_before >= dynamic_free_limit:
@@ -1190,48 +1124,34 @@ async def upload_document(
     extraction = _extract_text(path)
     text = extraction["text"] or ""
 
-    if not text.strip():
+    if not text.strip() or extraction.get("extract_method") == "fallback":
         return JSONResponse(
             status_code=400,
             content={
                 "error": "NO_TEXT_EXTRACTED",
-                "message": "Could not extract readable text from file",
+                "message": "Nie udało się odczytać tekstu dokumentu. Wgraj czytelny PDF albo DOCX z umową.",
                 "filename": file.filename,
                 "extract_method": extraction.get("extract_method"),
                 "used_ocr": extraction.get("used_ocr"),
             },
         )
 
-    if not is_probably_contract_document(text):
-        raise HTTPException(
+    if not looks_like_legal_document(text):
+        return JSONResponse(
             status_code=400,
-            detail={
-                "code": "NOT_CONTRACT_DOCUMENT",
-                "message": document_rejection_message(result_lang),
+            content={
+                "error": "NOT_CONTRACT_DOCUMENT",
+                "message": "Ten plik nie wygląda jak umowa, regulamin ani dokument prawny. Wgraj właściwy dokument PDF/DOCX.",
+                "filename": file.filename,
                 "extract_method": extraction.get("extract_method"),
                 "used_ocr": extraction.get("used_ocr"),
                 "text_len": len(text),
-                "contract_score": contract_likeness_score(text),
-                "text_sample": text[:800],
             },
         )
 
     doc_locale = choose_doc_locale(text)
     analysis_raw = analyze_contract_advanced(text, doc_locale, result_lang)
     analysis = normalize_analysis(analysis_raw, result_lang)
-
-    if not pro and used_before == 0:
-        trial_result = start_trial(current_user.uid, days=3, source="auto_first_analysis")
-        trial_started_now = bool(trial_result.get("started"))
-        pro = is_pro_user(current_user.uid)
-        trial_until = get_trial_until(current_user.uid)
-        trial_record = get_pro_record(current_user.uid)
-        is_trial_active = bool(trial_record.get("trial_active"))
-        dynamic_free_limit = 999999 if pro else 2
-        free_left_before = max(dynamic_free_limit - used_before, 0)
-
-        if trial_started_now:
-            print(f"🔥 TRIAL STARTED uid={current_user.uid} until={trial_until}")
 
     wants_ai = str(ai).lower() == "true"
 
@@ -1276,9 +1196,6 @@ async def upload_document(
         "doc_locale": doc_locale,
         "result_lang": result_lang,
         "analysis_mode": mode,
-        "trial_started_now": trial_started_now,
-        "trial_until": trial_until,
-        "is_trial_active": is_trial_active,
         "used_ocr": extraction["used_ocr"],
         "extract_method": extraction["extract_method"],
         "ocr_avg_conf": extraction["ocr_avg_conf"],
@@ -1301,3 +1218,4 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
+
