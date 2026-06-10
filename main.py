@@ -508,23 +508,29 @@ def _extract_text(path: str) -> Dict[str, Any]:
             except Exception as e:
                 print("REPAIR ERROR:", e)
 
+        ocr_source = repaired if repaired != path else path
+        print("🔍 OCR source:", ocr_source)
+
         try:
             print("🔍 OCR attempt")
-            ocr = _ocr_pdf(path, lang="pol+eng+deu")
-            if ocr["text"]:
+            ocr = _ocr_pdf(ocr_source, lang="pol+eng+deu")
+            ocr_text = str(ocr.get("text") or "").strip()
+            print("🔍 OCR returned len:", len(ocr_text))
+            if ocr_text:
                 return {
-                    "text": ocr["text"],
+                    "text": ocr_text,
                     "used_ocr": True,
                     "ocr_avg_conf": ocr.get("ocr_avg_conf"),
-                    "extract_method": "ocr",
+                    "extract_method": ocr.get("extract_method") or "ocr",
                 }
         except Exception as e:
             print("OCR ERROR:", e)
 
         try:
             print("🔥 HARD OCR MODE")
-            hard = _ocr_pdf_rotations(path, lang="pol+eng+deu", dpi=350)
+            hard = _ocr_pdf_rotations(ocr_source, lang="pol+eng+deu", dpi=350)
             hard_text = str(hard.get("text") or "").strip()
+            print("🔥 HARD OCR returned len:", len(hard_text))
             if hard_text:
                 return {
                     "text": hard_text,
