@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "history.sqlite3")
 
@@ -11,11 +11,59 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(c: sqlite3.Cursor, table_name: str) -> set[str]:
+    rows = c.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _history_table_exists(c: sqlite3.Cursor) -> bool:
+    row = c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='history'"
+    ).fetchone()
+    return row is not None
+
+
+def _migrate_history_table_if_needed(conn: sqlite3.Connection) -> None:
+    c = conn.cursor()
+
+    if not _history_table_exists(c):
+        return
+
+    cols = _table_columns(c, "history")
+
+    # Stara baza miała device_id zamiast uid.
+    if "uid" not in cols:
+        print("🔥 MIGRATION: adding uid column to history")
+        c.execute("ALTER TABLE history ADD COLUMN uid TEXT NOT NULL DEFAULT 'legacy'")
+
+    # Dodatkowe bezpieczne migracje, gdyby któraś kolumna nie istniała.
+    cols = _table_columns(c, "history")
+
+    migrations = {
+        "contract_type": "ALTER TABLE history ADD COLUMN contract_type TEXT",
+        "pdf_path": "ALTER TABLE history ADD COLUMN pdf_path TEXT",
+        "ai_json": "ALTER TABLE history ADD COLUMN ai_json TEXT",
+        "content_hash": "ALTER TABLE history ADD COLUMN content_hash TEXT",
+    }
+
+    for col, sql in migrations.items():
+        if col not in cols:
+            print(f"🔥 MIGRATION: adding {col} column to history")
+            c.execute(sql)
+
+    conn.commit()
+
+
 def init_db() -> None:
+    print("🔥 INIT_DB RUNNING:", DB_PATH)
+
     conn = get_conn()
     c = conn.cursor()
 
-    # 🔥 NOWA STRUKTURA — UID zamiast device_id
+    # Najpierw spróbuj naprawić starą tabelę, jeśli już istnieje.
+    _migrate_history_table_if_needed(conn)
+
+    # Nowa struktura dla świeżej bazy.
     c.execute("""
     CREATE TABLE IF NOT EXISTS history (
         uid TEXT NOT NULL,
@@ -40,6 +88,9 @@ def init_db() -> None:
 def upsert_history(item: Dict[str, Any]) -> None:
     conn = get_conn()
     c = conn.cursor()
+
+    # Awaryjnie uruchom migrację też tutaj, gdyby aplikacja użyła starej bazy po starcie.
+    _migrate_history_table_if_needed(conn)
 
     c.execute("""
     INSERT INTO history (
@@ -79,6 +130,9 @@ def list_history(uid: str, limit: int = 100) -> List[Dict[str, Any]]:
     conn = get_conn()
     c = conn.cursor()
 
+    # Awaryjnie uruchom migrację też tutaj, żeby GET /history/list nie wywalał 500.
+    _migrate_history_table_if_needed(conn)
+
     rows = c.execute("""
     SELECT *
     FROM history
@@ -95,6 +149,8 @@ def delete_history(uid: str, item_id: str) -> bool:
     conn = get_conn()
     c = conn.cursor()
 
+    _migrate_history_table_if_needed(conn)
+
     cur = c.execute(
         "DELETE FROM history WHERE uid=? AND id=?",
         (uid, item_id),
@@ -108,6 +164,8 @@ def update_pdf_path(uid: str, item_id: str, pdf_path: str) -> bool:
     conn = get_conn()
     c = conn.cursor()
 
+    _migrate_history_table_if_needed(conn)
+
     cur = c.execute(
         "UPDATE history SET pdf_path=? WHERE uid=? AND id=?",
         (pdf_path, uid, item_id),
@@ -120,6 +178,8 @@ def update_pdf_path(uid: str, item_id: str, pdf_path: str) -> bool:
 def count_history(uid: str) -> int:
     conn = get_conn()
     c = conn.cursor()
+
+    _migrate_history_table_if_needed(conn)
 
     c.execute("SELECT COUNT(*) AS cnt FROM history WHERE uid=?", (uid,))
     row = c.fetchone()
