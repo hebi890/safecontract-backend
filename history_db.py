@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 from typing import Any, Dict, List
 
@@ -9,6 +10,17 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _json_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
 
 
 def _table_columns(c: sqlite3.Cursor, table_name: str) -> set[str]:
@@ -31,12 +43,10 @@ def _migrate_history_table_if_needed(conn: sqlite3.Connection) -> None:
 
     cols = _table_columns(c, "history")
 
-    # Stara baza miała device_id zamiast uid.
     if "uid" not in cols:
         print("🔥 MIGRATION: adding uid column to history")
         c.execute("ALTER TABLE history ADD COLUMN uid TEXT NOT NULL DEFAULT 'legacy'")
 
-    # Dodatkowe bezpieczne migracje, gdyby któraś kolumna nie istniała.
     cols = _table_columns(c, "history")
 
     migrations = {
@@ -60,10 +70,8 @@ def init_db() -> None:
     conn = get_conn()
     c = conn.cursor()
 
-    # Najpierw spróbuj naprawić starą tabelę, jeśli już istnieje.
     _migrate_history_table_if_needed(conn)
 
-    # Nowa struktura dla świeżej bazy.
     c.execute("""
     CREATE TABLE IF NOT EXISTS history (
         uid TEXT NOT NULL,
@@ -89,7 +97,6 @@ def upsert_history(item: Dict[str, Any]) -> None:
     conn = get_conn()
     c = conn.cursor()
 
-    # Awaryjnie uruchom migrację też tutaj, gdyby aplikacja użyła starej bazy po starcie.
     _migrate_history_table_if_needed(conn)
 
     c.execute("""
@@ -118,7 +125,7 @@ def upsert_history(item: Dict[str, Any]) -> None:
         item.get("contract_type"),
         item.get("pdf_path"),
         str(item.get("risk", "warning")),
-        item.get("ai_json"),
+        _json_or_none(item.get("ai_json")),
         item.get("content_hash"),
     ))
 
@@ -130,7 +137,6 @@ def list_history(uid: str, limit: int = 100) -> List[Dict[str, Any]]:
     conn = get_conn()
     c = conn.cursor()
 
-    # Awaryjnie uruchom migrację też tutaj, żeby GET /history/list nie wywalał 500.
     _migrate_history_table_if_needed(conn)
 
     rows = c.execute("""
