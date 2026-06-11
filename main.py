@@ -5,6 +5,8 @@ import uuid
 import shutil
 import hashlib
 import subprocess
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Depends
@@ -54,12 +56,137 @@ TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
+
+TRIAL_DB_PATH = os.path.join(BASE_DIR, "trial_usage.sqlite3")
+TRIAL_DAYS = 3
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt_to_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_iso_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def init_trial_db() -> None:
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trial_usage (
+                uid TEXT PRIMARY KEY,
+                email TEXT,
+                started_at TEXT NOT NULL,
+                trial_until TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _trial_row(uid: str) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT uid, email, started_at, trial_until FROM trial_usage WHERE uid = ?",
+            (uid,),
+        ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str, Any]:
+    row = _trial_row(uid)
+    now = _utc_now()
+
+    if row is None:
+        return {
+            "is_trial_active": False,
+            "trial_available": True,
+            "trial_started": False,
+            "trial_until": None,
+            "trial_days": TRIAL_DAYS,
+            "email": email,
+        }
+
+    until = _parse_iso_dt(row.get("trial_until"))
+    active = bool(until and until > now)
+
+    return {
+        "is_trial_active": active,
+        "trial_available": False,
+        "trial_started": True,
+        "trial_until": row.get("trial_until"),
+        "trial_days": TRIAL_DAYS,
+        "email": row.get("email") or email,
+    }
+
+
+def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
+    status = get_trial_status_for_uid(current_user.uid, current_user.email)
+
+    if status.get("trial_started") and not status.get("is_trial_active"):
+        raise HTTPException(
+            status_code=409,
+            detail="Trial PRO został już wykorzystany na tym koncie.",
+        )
+
+    if status.get("is_trial_active"):
+        return {
+            **status,
+            "is_pro": True,
+        }
+
+    now = _utc_now()
+    until = now + timedelta(days=TRIAL_DAYS)
+
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO trial_usage (uid, email, started_at, trial_until)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                current_user.uid,
+                current_user.email,
+                _dt_to_iso(now),
+                _dt_to_iso(until),
+            ),
+        )
+        conn.commit()
+
+    return {
+        "is_pro": True,
+        "is_trial_active": True,
+        "trial_available": False,
+        "trial_started": True,
+        "trial_until": _dt_to_iso(until),
+        "trial_days": TRIAL_DAYS,
+        "email": current_user.email,
+    }
+
+
+def is_trial_active_for_uid(uid: str) -> bool:
+    return get_trial_status_for_uid(uid).get("is_trial_active") == True
+
+
 app = FastAPI(title="SafeContract API")
 
 init_firebase()
 init_db()
 init_user_usage_db()
 init_pro_user_db()
+init_trial_db()
 
 app.include_router(pro_router)
 app.include_router(history_router)
@@ -82,6 +209,51 @@ app.add_middleware(
 )
 
 SUPPORTED_LANGS = {"pl", "de", "en"}
+
+
+@app.get("/trial/status")
+def trial_status(current_user: CurrentUser = Depends(get_current_user)):
+    upsert_user(
+        uid=current_user.uid,
+        email=current_user.email,
+        name=current_user.name,
+        provider=current_user.provider,
+    )
+
+    trial = get_trial_status_for_uid(current_user.uid, current_user.email)
+    base_pro = is_pro_user(current_user.uid)
+
+    return {
+        **trial,
+        "is_pro": base_pro or trial.get("is_trial_active") == True,
+        "user_id": current_user.uid,
+        "is_anonymous": current_user.is_anonymous,
+    }
+
+
+@app.post("/trial/start")
+def trial_start(current_user: CurrentUser = Depends(get_current_user)):
+    if current_user.is_anonymous:
+        raise HTTPException(
+            status_code=401,
+            detail="Zaloguj się przez Google, aby rozpocząć 3-dniowy trial PRO.",
+        )
+
+    upsert_user(
+        uid=current_user.uid,
+        email=current_user.email,
+        name=current_user.name,
+        provider=current_user.provider,
+    )
+
+    trial = start_trial_for_user(current_user)
+
+    return {
+        **trial,
+        "user_id": current_user.uid,
+        "is_anonymous": current_user.is_anonymous,
+    }
+
 
 
 CATEGORY_LABELS = {
@@ -1191,7 +1363,8 @@ async def upload_document(
         provider=current_user.provider,
     )
 
-    pro = is_pro_user(current_user.uid)
+    trial_status_data = get_trial_status_for_uid(current_user.uid, current_user.email)
+    pro = is_pro_user(current_user.uid) or trial_status_data.get("is_trial_active") == True
     used_before = get_free_used(current_user.uid)
 
     dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
@@ -1303,6 +1476,9 @@ async def upload_document(
         "filename": name,
         "original_filename": file.filename,
         "is_pro": pro,
+        "is_trial_active": trial_status_data.get("is_trial_active") == True,
+        "trial_until": trial_status_data.get("trial_until"),
+        "trial_available": trial_status_data.get("trial_available"),
         "user_id": current_user.uid,
         "doc_locale": doc_locale,
         "result_lang": result_lang,
@@ -1328,5 +1504,5 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v4_user_auth_uid_pdf_hardcore"}
+    return {"ok": True, "analysis_version": "v5_trial_3_days"}
 
