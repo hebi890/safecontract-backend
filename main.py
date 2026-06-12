@@ -105,6 +105,36 @@ def _trial_row(uid: str) -> Optional[Dict[str, Any]]:
     return dict(row)
 
 
+def _trial_key_for_user(current_user: CurrentUser) -> str:
+    """Separate guest trial from Google account trial.
+
+    Firebase may keep the same UID when an anonymous guest is linked to Google.
+    Product decision: a guest/session trial and a Google account trial should not
+    accidentally share the same remaining time. Therefore Google users are keyed
+    by e-mail, guests by anonymous UID.
+    """
+    email = (current_user.email or "").strip().lower()
+    if email and not current_user.is_anonymous:
+        return f"google:{email}"
+    return f"anon:{current_user.uid}"
+
+
+def _trial_remaining_payload(until: Optional[datetime]) -> Dict[str, Any]:
+    if not until:
+        return {"trial_remaining_seconds": 0, "trial_remaining_days": 0}
+
+    seconds = max(0, int((until - _utc_now()).total_seconds()))
+    if seconds <= 0:
+        return {"trial_remaining_seconds": 0, "trial_remaining_days": 0}
+
+    # Ceiling days: almost 72h should be shown as 3 days, not 2.
+    days = (seconds + 86399) // 86400
+    if days > TRIAL_DAYS:
+        days = TRIAL_DAYS
+
+    return {"trial_remaining_seconds": seconds, "trial_remaining_days": days}
+
+
 def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str, Any]:
     row = _trial_row(uid)
     now = _utc_now()
@@ -117,6 +147,7 @@ def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str,
             "trial_until": None,
             "trial_days": TRIAL_DAYS,
             "email": email,
+            **_trial_remaining_payload(None),
         }
 
     until = _parse_iso_dt(row.get("trial_until"))
@@ -129,6 +160,7 @@ def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str,
         "trial_until": row.get("trial_until"),
         "trial_days": TRIAL_DAYS,
         "email": row.get("email") or email,
+        **_trial_remaining_payload(until),
     }
 
 
@@ -140,7 +172,8 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
     Firebase anonymous auth gives us a stable UID for that install/session, and Google
     login can still be used later for account continuity.
     """
-    status = get_trial_status_for_uid(current_user.uid, current_user.email)
+    trial_key = _trial_key_for_user(current_user)
+    status = get_trial_status_for_uid(trial_key, current_user.email)
 
     # Trial already exists. If still active, keep PRO. If expired, return FREE state
     # instead of throwing 409, so automatic checks do not show scary errors.
@@ -160,7 +193,7 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
             VALUES (?, ?, ?, ?)
             """,
             (
-                current_user.uid,
+                trial_key,
                 current_user.email,
                 _dt_to_iso(now),
                 _dt_to_iso(until),
@@ -176,6 +209,7 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
         "trial_until": _dt_to_iso(until),
         "trial_days": TRIAL_DAYS,
         "email": current_user.email,
+        **_trial_remaining_payload(until),
     }
 
 
@@ -1506,5 +1540,5 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v6_auto_trial_3_days"}
+    return {"ok": True, "analysis_version": "v7_trial_account_timefix"}
 
