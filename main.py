@@ -133,18 +133,21 @@ def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str,
 
 
 def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
+    """Start 3-day trial for any Firebase user, including anonymous guest.
+
+    Important: this is intentionally NOT limited to Google accounts.
+    The product decision is: every new user should be able to test PRO for 3 days.
+    Firebase anonymous auth gives us a stable UID for that install/session, and Google
+    login can still be used later for account continuity.
+    """
     status = get_trial_status_for_uid(current_user.uid, current_user.email)
 
-    if status.get("trial_started") and not status.get("is_trial_active"):
-        raise HTTPException(
-            status_code=409,
-            detail="Trial PRO został już wykorzystany na tym koncie.",
-        )
-
-    if status.get("is_trial_active"):
+    # Trial already exists. If still active, keep PRO. If expired, return FREE state
+    # instead of throwing 409, so automatic checks do not show scary errors.
+    if status.get("trial_started"):
         return {
             **status,
-            "is_pro": True,
+            "is_pro": status.get("is_trial_active") == True,
         }
 
     now = _utc_now()
@@ -174,6 +177,11 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
         "trial_days": TRIAL_DAYS,
         "email": current_user.email,
     }
+
+
+def ensure_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
+    """Auto-start trial if it was never used. Otherwise return current status."""
+    return start_trial_for_user(current_user)
 
 
 def is_trial_active_for_uid(uid: str) -> bool:
@@ -220,7 +228,7 @@ def trial_status(current_user: CurrentUser = Depends(get_current_user)):
         provider=current_user.provider,
     )
 
-    trial = get_trial_status_for_uid(current_user.uid, current_user.email)
+    trial = ensure_trial_for_user(current_user)
     base_pro = is_pro_user(current_user.uid)
 
     return {
@@ -233,12 +241,6 @@ def trial_status(current_user: CurrentUser = Depends(get_current_user)):
 
 @app.post("/trial/start")
 def trial_start(current_user: CurrentUser = Depends(get_current_user)):
-    if current_user.is_anonymous:
-        raise HTTPException(
-            status_code=401,
-            detail="Zaloguj się przez Google, aby rozpocząć 3-dniowy trial PRO.",
-        )
-
     upsert_user(
         uid=current_user.uid,
         email=current_user.email,
@@ -1363,7 +1365,7 @@ async def upload_document(
         provider=current_user.provider,
     )
 
-    trial_status_data = get_trial_status_for_uid(current_user.uid, current_user.email)
+    trial_status_data = ensure_trial_for_user(current_user)
     pro = is_pro_user(current_user.uid) or trial_status_data.get("is_trial_active") == True
     used_before = get_free_used(current_user.uid)
 
@@ -1504,5 +1506,5 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v5_trial_3_days"}
+    return {"ok": True, "analysis_version": "v6_auto_trial_3_days"}
 
