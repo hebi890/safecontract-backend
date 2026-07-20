@@ -9,3 +9,5 @@ pdf2image
 Pillow
 openai
 firebase-admin==6.8.0
+google-api-python-client
+google-auth

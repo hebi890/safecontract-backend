@@ -32,7 +32,7 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import init_pro_user_db, is_pro_user
+from pro_user_db import init_pro_user_db, is_pro_user, is_paid_pro_user
 from pro_routes_uid import router as pro_router
 
 import PyPDF2
@@ -1400,7 +1400,8 @@ async def upload_document(
     )
 
     trial_status_data = ensure_trial_for_user(current_user)
-    pro = is_pro_user(current_user.uid) or trial_status_data.get("is_trial_active") == True
+    paid_pro = is_paid_pro_user(current_user.uid)
+    pro = paid_pro or trial_status_data.get("is_trial_active") == True
     used_before = get_free_used(current_user.uid)
 
     dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
@@ -1512,6 +1513,7 @@ async def upload_document(
         "filename": name,
         "original_filename": file.filename,
         "is_pro": pro,
+        "is_paid_pro": paid_pro,
         "is_trial_active": trial_status_data.get("is_trial_active") == True,
         "trial_until": trial_status_data.get("trial_until"),
         "trial_available": trial_status_data.get("trial_available"),
