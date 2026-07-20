@@ -28,6 +28,21 @@ def init_firebase() -> None:
     firebase_admin.initialize_app(cred)
 
 
+def is_anonymous_uid(uid: str) -> bool:
+    """Return True only when Firebase confirms that the UID is anonymous."""
+    uid = (uid or "").strip()
+    if not uid:
+        return False
+
+    try:
+        user = auth.get_user(uid)
+    except Exception:
+        # If Firebase cannot confirm the account type, do not allow a transfer.
+        return False
+
+    return not user.email and not list(user.provider_data or [])
+
+
 @dataclass
 class CurrentUser:
     uid: str

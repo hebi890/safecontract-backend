@@ -2,7 +2,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth_firebase import CurrentUser, get_current_user
+from auth_firebase import CurrentUser, get_current_user, is_anonymous_uid
 from google_play_verifier import DEFAULT_PACKAGE_NAME, DEFAULT_PRODUCT_ID, verify_google_play_subscription
 from pro_user_db import (
     clear_paid_pro_if_expired,
@@ -13,6 +13,7 @@ from pro_user_db import (
     set_google_subscription_user,
     set_pro_user,
     start_trial,
+    transfer_google_subscription_user,
 )
 from user_usage_db import get_free_used
 
@@ -129,10 +130,6 @@ def pro_google_play_verify(
     if body.package_name != DEFAULT_PACKAGE_NAME:
         raise HTTPException(status_code=400, detail="Invalid package_name")
 
-    token_owner = get_uid_for_purchase_token(body.purchase_token)
-    if token_owner and token_owner != current_user.uid:
-        raise HTTPException(status_code=409, detail="Purchase token is already linked to another user")
-
     result = verify_google_play_subscription(
         package_name=body.package_name,
         product_id=body.product_id,
@@ -149,15 +146,47 @@ def pro_google_play_verify(
             },
         )
 
-    set_google_subscription_user(
-        current_user.uid,
-        product_id=body.product_id,
-        purchase_token=body.purchase_token,
-        subscription_state=str(result.get("subscription_state") or ""),
-        pro_until=str(result.get("expiry_time") or ""),
-        order_id=result.get("order_id"),
-        source="google_play_verify",
-    )
+    token_owner = get_uid_for_purchase_token(body.purchase_token)
+    transferred_from_anonymous = False
+
+    if token_owner and token_owner != current_user.uid:
+        can_transfer_from_guest = (
+            not current_user.is_anonymous
+            and is_anonymous_uid(token_owner)
+        )
+        if not can_transfer_from_guest:
+            raise HTTPException(
+                status_code=409,
+                detail="Purchase token is already linked to another user",
+            )
+
+        try:
+            transfer_google_subscription_user(
+                token_owner,
+                current_user.uid,
+                product_id=body.product_id,
+                purchase_token=body.purchase_token,
+                subscription_state=str(result.get("subscription_state") or ""),
+                pro_until=str(result.get("expiry_time") or ""),
+                order_id=result.get("order_id"),
+            )
+        except ValueError:
+            # The owner changed concurrently; fail closed instead of duplicating access.
+            raise HTTPException(
+                status_code=409,
+                detail="Purchase token owner changed during transfer",
+            )
+        transferred_from_anonymous = True
+    else:
+        set_google_subscription_user(
+            current_user.uid,
+            product_id=body.product_id,
+            purchase_token=body.purchase_token,
+            subscription_state=str(result.get("subscription_state") or ""),
+            pro_until=str(result.get("expiry_time") or ""),
+            order_id=result.get("order_id"),
+            source="google_play_verify",
+        )
 
     return {
         "ok": True,
@@ -167,6 +196,7 @@ def pro_google_play_verify(
         "product_id": body.product_id,
         "pro_until": result.get("expiry_time"),
         "subscription_state": result.get("subscription_state"),
+        "transferred_from_anonymous": transferred_from_anonymous,
     }
 
 

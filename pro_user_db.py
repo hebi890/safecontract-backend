@@ -215,6 +215,91 @@ def set_google_subscription_user(
         conn.commit()
 
 
+def transfer_google_subscription_user(
+    from_uid: str,
+    to_uid: str,
+    *,
+    product_id: str,
+    purchase_token: str,
+    subscription_state: str,
+    pro_until: str,
+    order_id: Optional[str] = None,
+) -> None:
+    """Atomically move an active Google Play subscription to another UID."""
+    from_uid = (from_uid or "").strip()
+    to_uid = (to_uid or "").strip()
+    purchase_token = (purchase_token or "").strip()
+
+    if not from_uid or not to_uid or from_uid == to_uid:
+        raise ValueError("Invalid subscription transfer users")
+    if not purchase_token:
+        raise ValueError("Missing purchase token")
+
+    now = _iso(_utcnow())
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        owner = conn.execute(
+            "SELECT uid FROM pro_users WHERE purchase_token = ? LIMIT 1",
+            (purchase_token,),
+        ).fetchone()
+
+        if not owner or owner["uid"] != from_uid:
+            raise ValueError("Purchase token owner changed during transfer")
+
+        # Remove paid access from the anonymous account, but preserve its trial.
+        conn.execute(
+            """
+            UPDATE pro_users
+            SET is_pro = 0,
+                source = ?,
+                updated_at = ?,
+                pro_until = NULL,
+                product_id = NULL,
+                purchase_token = NULL,
+                subscription_state = ?,
+                order_id = NULL
+            WHERE uid = ? AND purchase_token = ?
+            """,
+            (
+                "google_play_transferred_out",
+                now,
+                "transferred",
+                from_uid,
+                purchase_token,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO pro_users(uid, is_pro, source, updated_at, trial_until, trial_started_at,
+                                  pro_until, product_id, purchase_token, subscription_state, order_id)
+            VALUES (?, 1, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET
+                is_pro = 1,
+                source = excluded.source,
+                updated_at = excluded.updated_at,
+                pro_until = excluded.pro_until,
+                product_id = excluded.product_id,
+                purchase_token = excluded.purchase_token,
+                subscription_state = excluded.subscription_state,
+                order_id = excluded.order_id
+            """,
+            (
+                to_uid,
+                "google_play_transfer_from_anonymous",
+                now,
+                pro_until,
+                product_id,
+                purchase_token,
+                subscription_state,
+                order_id,
+            ),
+        )
+        conn.commit()
+
+
 def clear_paid_pro_if_expired(uid: str) -> None:
     record = get_pro_record(uid)
     pro_dt = _parse_iso(record.get("pro_until"))
