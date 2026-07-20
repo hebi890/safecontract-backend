@@ -32,8 +32,8 @@ from user_usage_db import (
     init_user_usage_db,
     upsert_user,
 )
-from pro_user_db import init_pro_user_db, is_pro_user, is_paid_pro_user
-from pro_routes_uid import router as pro_router
+from pro_user_db import init_pro_user_db, is_paid_pro_user
+from pro_routes_uid import router as pro_router, refresh_google_subscription_if_possible
 
 import PyPDF2
 from docx import Document
@@ -213,11 +213,6 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
     }
 
 
-def ensure_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
-    """Auto-start trial if it was never used. Otherwise return current status."""
-    return start_trial_for_user(current_user)
-
-
 def is_trial_active_for_uid(uid: str) -> bool:
     return get_trial_status_for_uid(uid).get("is_trial_active") == True
 
@@ -262,12 +257,19 @@ def trial_status(current_user: CurrentUser = Depends(get_current_user)):
         provider=current_user.provider,
     )
 
-    trial = ensure_trial_for_user(current_user)
-    base_pro = is_pro_user(current_user.uid)
+    # GET must never activate a trial. A new account remains FREE until the
+    # user explicitly calls POST /trial/start.
+    trial = get_trial_status_for_uid(
+        _trial_key_for_user(current_user),
+        current_user.email,
+    )
+    paid_pro = is_paid_pro_user(current_user.uid)
 
     return {
         **trial,
-        "is_pro": base_pro or trial.get("is_trial_active") == True,
+        "is_pro": paid_pro or trial.get("is_trial_active") == True,
+        "is_paid_pro": paid_pro,
+        "is_trial_active": trial.get("is_trial_active") == True and not paid_pro,
         "user_id": current_user.uid,
         "is_anonymous": current_user.is_anonymous,
     }
@@ -287,6 +289,54 @@ def trial_start(current_user: CurrentUser = Depends(get_current_user)):
     return {
         **trial,
         "user_id": current_user.uid,
+        "is_anonymous": current_user.is_anonymous,
+    }
+
+
+@app.get("/entitlements/status")
+def entitlements_status(current_user: CurrentUser = Depends(get_current_user)):
+    """Single source of truth for the FREE / TRIAL / paid PRO UI state."""
+    upsert_user(
+        uid=current_user.uid,
+        email=current_user.email,
+        name=current_user.name,
+        provider=current_user.provider,
+    )
+
+    try:
+        refresh_google_subscription_if_possible(current_user.uid)
+    except Exception as exc:
+        # Entitlement reads remain available during a temporary Google outage.
+        print("Google Play refresh skipped:", exc)
+
+    trial = get_trial_status_for_uid(
+        _trial_key_for_user(current_user),
+        current_user.email,
+    )
+    paid_pro = is_paid_pro_user(current_user.uid)
+    tester_emails = {
+        e.strip().lower()
+        for e in os.getenv("SAFE_CONTRACT_TESTER_EMAILS", "").split(",")
+        if e.strip()
+    }
+    email = (current_user.email or "").strip().lower()
+    tester = bool(email and email in tester_emails)
+    trial_active = trial.get("is_trial_active") == True
+    effective_pro = paid_pro or tester or trial_active
+    used = get_free_used(current_user.uid)
+    free_limit = 999999 if effective_pro else (1 if current_user.is_anonymous else 2)
+
+    return {
+        **trial,
+        "uid": current_user.uid,
+        "is_pro": effective_pro,
+        "is_paid_pro": paid_pro,
+        "is_tester": tester,
+        "is_trial_active": trial_active and not (paid_pro or tester),
+        "plan": "PRO" if (paid_pro or tester) else ("TRIAL" if trial_active else "FREE"),
+        "free_limit": free_limit,
+        "free_used": used,
+        "free_left": max(free_limit - used, 0),
         "is_anonymous": current_user.is_anonymous,
     }
 
@@ -1399,7 +1449,11 @@ async def upload_document(
         provider=current_user.provider,
     )
 
-    trial_status_data = ensure_trial_for_user(current_user)
+    # Uploading a document must not silently start the trial either.
+    trial_status_data = get_trial_status_for_uid(
+        _trial_key_for_user(current_user),
+        current_user.email,
+    )
     paid_pro = is_paid_pro_user(current_user.uid)
     pro = paid_pro or trial_status_data.get("is_trial_active") == True
     used_before = get_free_used(current_user.uid)
@@ -1514,7 +1568,7 @@ async def upload_document(
         "original_filename": file.filename,
         "is_pro": pro,
         "is_paid_pro": paid_pro,
-        "is_trial_active": trial_status_data.get("is_trial_active") == True,
+        "is_trial_active": trial_status_data.get("is_trial_active") == True and not paid_pro,
         "trial_until": trial_status_data.get("trial_until"),
         "trial_available": trial_status_data.get("trial_available"),
         "user_id": current_user.uid,
@@ -1543,4 +1597,3 @@ async def upload_document(
 @app.get("/health")
 def health():
     return {"ok": True, "analysis_version": "v7_trial_account_timefix"}
-

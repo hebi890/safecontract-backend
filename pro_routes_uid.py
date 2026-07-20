@@ -9,10 +9,8 @@ from pro_user_db import (
     get_pro_record,
     get_uid_for_purchase_token,
     is_paid_pro_user,
-    is_pro_user,
     set_google_subscription_user,
     set_pro_user,
-    start_trial,
     transfer_google_subscription_user,
 )
 from user_usage_db import get_free_used
@@ -41,7 +39,7 @@ def is_tester_user(current_user: CurrentUser) -> bool:
     return bool(email and email in TESTER_EMAILS)
 
 
-def _refresh_google_subscription_if_possible(uid: str) -> None:
+def refresh_google_subscription_if_possible(uid: str) -> None:
     record = get_pro_record(uid)
     token = (record.get("purchase_token") or "").strip()
     product_id = (record.get("product_id") or DEFAULT_PRODUCT_ID).strip()
@@ -73,7 +71,7 @@ def _refresh_google_subscription_if_possible(uid: str) -> None:
 @router.get("/status")
 def pro_status(current_user: CurrentUser = Depends(get_current_user)):
     try:
-        _refresh_google_subscription_if_possible(current_user.uid)
+        refresh_google_subscription_if_possible(current_user.uid)
     except Exception as e:
         # Status should still work if Google API is temporarily unavailable.
         print("Google Play refresh skipped:", e)
@@ -81,7 +79,9 @@ def pro_status(current_user: CurrentUser = Depends(get_current_user)):
     tester = is_tester_user(current_user)
     record = get_pro_record(current_user.uid)
     paid_pro = is_paid_pro_user(current_user.uid)
-    is_pro = is_pro_user(current_user.uid) or tester
+    # Legacy endpoint is paid-PRO only. Trial state lives in trial_usage and is
+    # exposed together with paid state by GET /entitlements/status.
+    is_pro = paid_pro or tester
     used = get_free_used(current_user.uid)
 
     free_limit = 999999 if is_pro else 2
@@ -93,9 +93,9 @@ def pro_status(current_user: CurrentUser = Depends(get_current_user)):
         "is_pro": is_pro,
         "is_paid_pro": paid_pro,
         "is_tester": tester,
-        "is_trial_active": bool(record.get("trial_active")),
-        "trial_until": record.get("trial_until"),
-        "trial_started_at": record.get("trial_started_at"),
+        "is_trial_active": False,
+        "trial_until": None,
+        "trial_started_at": None,
         "pro_until": record.get("pro_until"),
         "subscription_state": record.get("subscription_state"),
         "product_id": record.get("product_id"),
@@ -108,15 +108,10 @@ def pro_status(current_user: CurrentUser = Depends(get_current_user)):
 
 @router.post("/start_trial")
 def pro_start_trial(current_user: CurrentUser = Depends(get_current_user)):
-    result = start_trial(current_user.uid, days=3, source="manual_start_trial")
-    return {
-        "ok": True,
-        "uid": current_user.uid,
-        "started": bool(result.get("started")),
-        "is_pro": bool(result.get("is_pro")),
-        "is_trial_active": bool(result.get("trial_active")),
-        "trial_until": result.get("trial_until"),
-    }
+    raise HTTPException(
+        status_code=410,
+        detail={"code": "TRIAL_ENDPOINT_MOVED", "endpoint": "/trial/start"},
+    )
 
 
 @router.post("/google-play/verify")
