@@ -88,6 +88,37 @@ class GooglePlayTransferTests(unittest.TestCase):
             "real-owner",
         )
 
+    def test_inactive_state_revokes_access_but_keeps_token_for_refresh(self):
+        token = "purchase-token"
+        expiry = self._future_expiry()
+        uid = "google-uid"
+
+        pro_user_db.set_google_subscription_user(
+            uid,
+            product_id="safecontract_pro",
+            purchase_token=token,
+            subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+            pro_until=expiry,
+        )
+        pro_user_db.set_google_subscription_inactive(
+            uid,
+            subscription_state="SUBSCRIPTION_STATE_ON_HOLD",
+            pro_until=expiry,
+        )
+
+        inactive = pro_user_db.get_pro_record(uid)
+        self.assertFalse(inactive["paid_pro_active"])
+        self.assertEqual(inactive["purchase_token"], token)
+
+        pro_user_db.set_google_subscription_user(
+            uid,
+            product_id="safecontract_pro",
+            purchase_token=token,
+            subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+            pro_until=expiry,
+        )
+        self.assertTrue(pro_user_db.is_paid_pro_user(uid))
+
 
 if __name__ == "__main__":
     unittest.main()

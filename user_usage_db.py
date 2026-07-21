@@ -1,10 +1,17 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-DB_PATH = os.getenv("APP_DB_PATH", "app.sqlite3")
+DB_PATH = os.path.abspath(
+    os.getenv("APP_DB_PATH", os.path.join(os.path.dirname(__file__), "app.sqlite3"))
+)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "2"))
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @contextmanager
@@ -41,11 +48,20 @@ def init_user_usage_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_free_usage (
+                device_key TEXT PRIMARY KEY,
+                free_used INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
 def upsert_user(uid: str, email: str | None, name: str | None, provider: str | None) -> None:
-    now = datetime.utcnow().isoformat()
+    now = _utcnow().isoformat()
 
     with get_conn() as conn:
         conn.execute(
@@ -90,7 +106,7 @@ def can_use_free(uid: str) -> bool:
 
 
 def increment_free_used(uid: str) -> int:
-    now = datetime.utcnow().isoformat()
+    now = _utcnow().isoformat()
 
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -122,3 +138,75 @@ def increment_free_used(uid: str) -> int:
         )
         conn.commit()
         return new_value
+
+
+def ensure_device_usage(device_key: str, seed_used: int = 0) -> None:
+    """Create a device counter and preserve the largest known legacy count."""
+    now = _utcnow().isoformat()
+    seed = max(0, int(seed_used or 0))
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO device_free_usage(device_key, free_used, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(device_key) DO UPDATE SET
+                free_used = MAX(device_free_usage.free_used, excluded.free_used),
+                updated_at = excluded.updated_at
+            """,
+            (device_key, seed, now),
+        )
+        conn.commit()
+
+
+def get_device_free_used(device_key: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT free_used FROM device_free_usage WHERE device_key = ?",
+            (device_key,),
+        ).fetchone()
+        return int(row["free_used"]) if row else 0
+
+
+def increment_device_free_used(device_key: str) -> int:
+    now = _utcnow().isoformat()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT free_used FROM device_free_usage WHERE device_key = ?",
+            (device_key,),
+        ).fetchone()
+        new_value = (int(row["free_used"]) if row else 0) + 1
+        conn.execute(
+            """
+            INSERT INTO device_free_usage(device_key, free_used, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(device_key) DO UPDATE SET
+                free_used = excluded.free_used,
+                updated_at = excluded.updated_at
+            """,
+            (device_key, new_value, now),
+        )
+        conn.commit()
+        return new_value
+
+
+def purge_stale_device_usage(max_age_days: int = 730) -> int:
+    """Remove pseudonymous anti-abuse counters after prolonged inactivity."""
+    cutoff = (_utcnow() - timedelta(days=max(1, max_age_days))).isoformat()
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "DELETE FROM device_free_usage WHERE updated_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
+
+
+def delete_user_usage(uid: str) -> None:
+    """Delete account-linked usage. Device anti-abuse counters are retained."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM free_usage WHERE uid = ?", (uid,))
+        conn.execute("DELETE FROM users WHERE uid = ?", (uid,))
+        conn.commit()

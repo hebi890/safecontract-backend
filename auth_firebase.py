@@ -43,6 +43,10 @@ def is_anonymous_uid(uid: str) -> bool:
     return not user.email and not list(user.provider_data or [])
 
 
+def delete_firebase_user(uid: str) -> None:
+    auth.delete_user(uid)
+
+
 @dataclass
 class CurrentUser:
     uid: str
@@ -50,6 +54,14 @@ class CurrentUser:
     name: Optional[str]
     provider: Optional[str]
     is_anonymous: bool
+
+
+def is_google_user(current_user: CurrentUser) -> bool:
+    return (
+        not current_user.is_anonymous
+        and current_user.provider == "google.com"
+        and bool((current_user.email or "").strip())
+    )
 
 
 def get_current_user(authorization: Optional[str] = Header(default=None)) -> CurrentUser:
@@ -69,12 +81,17 @@ def get_current_user(authorization: Optional[str] = Header(default=None)) -> Cur
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     firebase_data = decoded.get("firebase", {}) or {}
-    provider = firebase_data.get("sign_in_provider")
+    sign_in_provider = firebase_data.get("sign_in_provider")
+    identities = firebase_data.get("identities", {}) or {}
+    # Match Flutter's providerData check: an account linked with Google is a
+    # Google account even if Firebase refreshed the token through another
+    # linked sign-in method.
+    provider = "google.com" if identities.get("google.com") else sign_in_provider
 
     return CurrentUser(
         uid=decoded["uid"],
         email=decoded.get("email"),
         name=decoded.get("name"),
         provider=provider,
-        is_anonymous=(provider == "anonymous"),
+        is_anonymous=(sign_in_provider == "anonymous"),
     )

@@ -4,7 +4,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-DB_PATH = os.getenv("APP_DB_PATH", "app.sqlite3")
+DB_PATH = os.path.abspath(
+    os.getenv("APP_DB_PATH", os.path.join(os.path.dirname(__file__), "app.sqlite3"))
+)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 @contextmanager
@@ -18,7 +21,7 @@ def get_conn():
 
 
 def _utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _iso(dt: datetime) -> str:
@@ -215,6 +218,31 @@ def set_google_subscription_user(
         conn.commit()
 
 
+def set_google_subscription_inactive(
+    uid: str,
+    *,
+    subscription_state: str,
+    pro_until: Optional[str] = None,
+    source: str = "google_play_inactive",
+) -> None:
+    """Revoke paid access while retaining the token for later refresh/restore."""
+    now = _iso(_utcnow())
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE pro_users
+            SET is_pro = 0,
+                source = ?,
+                updated_at = ?,
+                subscription_state = ?,
+                pro_until = COALESCE(?, pro_until)
+            WHERE uid = ?
+            """,
+            (source, now, subscription_state, pro_until, uid),
+        )
+        conn.commit()
+
+
 def transfer_google_subscription_user(
     from_uid: str,
     to_uid: str,
@@ -329,6 +357,12 @@ def get_uid_for_purchase_token(purchase_token: str) -> Optional[str]:
         ).fetchone()
 
     return row["uid"] if row else None
+
+
+def delete_pro_user(uid: str) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pro_users WHERE uid = ?", (uid,))
+        conn.commit()
 
 
 def start_trial(uid: str, days: int = 3, source: str = "trial_auto") -> Dict[str, Any]:

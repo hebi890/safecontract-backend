@@ -2,7 +2,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth_firebase import CurrentUser, get_current_user, is_anonymous_uid
+from auth_firebase import CurrentUser, get_current_user, is_anonymous_uid, is_google_user
 from google_play_verifier import DEFAULT_PACKAGE_NAME, DEFAULT_PRODUCT_ID, verify_google_play_subscription
 from pro_user_db import (
     clear_paid_pro_if_expired,
@@ -10,6 +10,7 @@ from pro_user_db import (
     get_uid_for_purchase_token,
     is_paid_pro_user,
     set_google_subscription_user,
+    set_google_subscription_inactive,
     set_pro_user,
     transfer_google_subscription_user,
 )
@@ -64,7 +65,20 @@ def refresh_google_subscription_if_possible(uid: str) -> None:
             order_id=result.get("order_id"),
             source="google_play_refresh",
         )
+    elif result.get("reason") not in {"GOOGLE_HTTP_ERROR", "GOOGLE_VERIFY_ERROR"}:
+        # ON_HOLD, PAUSED, PENDING and EXPIRED do not grant access even when
+        # Google still reports a future expiry date. Keep the token so a later
+        # status refresh can restore access after the state becomes active.
+        set_google_subscription_inactive(
+            uid,
+            subscription_state=str(
+                result.get("subscription_state") or result.get("reason") or "inactive"
+            ),
+            pro_until=result.get("expiry_time"),
+        )
     else:
+        # A temporary Google/API error must not erase a previously verified
+        # entitlement. The locally stored expiry still applies.
         clear_paid_pro_if_expired(uid)
 
 
@@ -119,6 +133,12 @@ def pro_google_play_verify(
     body: GooglePlayVerifyRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    if not is_google_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "GOOGLE_LOGIN_REQUIRED"},
+        )
+
     if body.product_id != DEFAULT_PRODUCT_ID:
         raise HTTPException(status_code=400, detail="Invalid product_id")
 

@@ -3,7 +3,16 @@ import json
 import sqlite3
 from typing import Any, Dict, List
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "history.sqlite3")
+_APP_DB_PATH = os.path.abspath(
+    os.getenv("APP_DB_PATH", os.path.join(os.path.dirname(__file__), "app.sqlite3"))
+)
+DB_PATH = os.path.abspath(
+    os.getenv(
+        "HISTORY_DB_PATH",
+        os.path.join(os.path.dirname(_APP_DB_PATH), "history.sqlite3"),
+    )
+)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -164,6 +173,15 @@ def delete_history(uid: str, item_id: str) -> bool:
     conn.commit()
     conn.close()
     return cur.rowcount > 0
+
+
+def delete_all_history(uid: str) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM history WHERE uid = ?", (uid,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def update_pdf_path(uid: str, item_id: str, pdf_path: str) -> bool:

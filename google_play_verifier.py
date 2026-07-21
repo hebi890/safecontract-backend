@@ -3,9 +3,16 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:  # Keep the API bootable and return a controlled verify error.
+    service_account = None
+    build = None
+
+    class HttpError(Exception):
+        pass
 
 ANDROID_PUBLISHER_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 DEFAULT_PACKAGE_NAME = os.getenv("GOOGLE_PLAY_PACKAGE_NAME", "pl.umownia.umownia")
@@ -14,10 +21,19 @@ DEFAULT_PRODUCT_ID = os.getenv("GOOGLE_PLAY_PRO_PRODUCT_ID", "safecontract_pro")
 ACTIVE_STATES = {
     "SUBSCRIPTION_STATE_ACTIVE",
     "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+    # Google Play keeps the entitlement active until expiry even after the
+    # user disables automatic renewal.
+    "SUBSCRIPTION_STATE_CANCELED",
 }
 
 
 def _credentials():
+    if service_account is None:
+        raise RuntimeError(
+            "Missing Google API dependencies. Install google-auth and "
+            "google-api-python-client."
+        )
+
     raw_json = os.getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
     file_path = os.getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_FILE")
 
@@ -41,6 +57,10 @@ def _credentials():
 
 
 def _android_publisher_service():
+    if build is None:
+        raise RuntimeError(
+            "Missing google-api-python-client dependency."
+        )
     return build(
         "androidpublisher",
         "v3",

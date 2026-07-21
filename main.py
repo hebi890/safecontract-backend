@@ -4,15 +4,16 @@ import json
 import uuid
 import shutil
 import hashlib
+import html
 import subprocess
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from dev_reset import router as dev_reset_router
 
 from dotenv import load_dotenv
@@ -21,19 +22,38 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 print("OPENAI_API_KEY present:", bool(OPENAI_API_KEY))
 
-from history_db import init_db
+from history_db import delete_all_history, init_db
 from ai_service import build_ai_input, call_ai_explain
 
 from history_routes import router as history_router
-from auth_firebase import init_firebase, CurrentUser, get_current_user
+from auth_firebase import (
+    delete_firebase_user,
+    init_firebase,
+    is_google_user,
+    CurrentUser,
+    get_current_user,
+)
 from user_usage_db import (
+    ensure_device_usage,
+    get_device_free_used,
     get_free_used,
-    increment_free_used,
+    increment_device_free_used,
     init_user_usage_db,
+    delete_user_usage,
+    purge_stale_device_usage,
     upsert_user,
 )
-from pro_user_db import init_pro_user_db, is_paid_pro_user
-from pro_routes_uid import router as pro_router, refresh_google_subscription_if_possible
+from pro_user_db import (
+    delete_pro_user,
+    get_pro_record,
+    init_pro_user_db,
+    is_paid_pro_user,
+)
+from pro_routes_uid import (
+    router as pro_router,
+    is_tester_user,
+    refresh_google_subscription_if_possible,
+)
 
 import PyPDF2
 from docx import Document
@@ -49,6 +69,7 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 AI_CACHE_PATH = os.path.join(BASE_DIR, "ai_cache.json")
+AI_CACHE_ENABLED = os.getenv("AI_CACHE_ENABLED", "false").lower() == "true"
 
 POPPLER_PATH = r"C:\poppler\Library\bin"
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -57,8 +78,25 @@ if os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 
-TRIAL_DB_PATH = os.path.join(BASE_DIR, "trial_usage.sqlite3")
+APP_DB_PATH = os.path.abspath(
+    os.getenv("APP_DB_PATH", os.path.join(BASE_DIR, "app.sqlite3"))
+)
+DATA_DIR = os.path.dirname(APP_DB_PATH)
+TRIAL_DB_PATH = os.path.abspath(
+    os.getenv("TRIAL_DB_PATH", os.path.join(DATA_DIR, "trial_usage.sqlite3"))
+)
+os.makedirs(os.path.dirname(TRIAL_DB_PATH), exist_ok=True)
 TRIAL_DAYS = 3
+FREE_ANALYSIS_LIMIT = 2
+DEVICE_ID_SALT = (
+    os.getenv("DEVICE_ID_SALT", "safecontract-device-v1").strip()
+    or "safecontract-device-v1"
+)
+ANTI_ABUSE_RETENTION_DAYS = max(
+    1,
+    int(os.getenv("ANTI_ABUSE_RETENTION_DAYS", "730")),
+)
+_last_anti_abuse_cleanup_at: Optional[datetime] = None
 
 
 def _utc_now() -> datetime:
@@ -86,8 +124,25 @@ def init_trial_db() -> None:
                 uid TEXT PRIMARY KEY,
                 email TEXT,
                 started_at TEXT NOT NULL,
-                trial_until TEXT NOT NULL
+                trial_until TEXT NOT NULL,
+                device_key TEXT,
+                deleted_at TEXT
             )
+            """
+        )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(trial_usage)").fetchall()
+        }
+        if "device_key" not in columns:
+            conn.execute("ALTER TABLE trial_usage ADD COLUMN device_key TEXT")
+        if "deleted_at" not in columns:
+            conn.execute("ALTER TABLE trial_usage ADD COLUMN deleted_at TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trial_usage_device_key
+            ON trial_usage(device_key)
+            WHERE device_key IS NOT NULL
             """
         )
         conn.commit()
@@ -97,7 +152,7 @@ def _trial_row(uid: str) -> Optional[Dict[str, Any]]:
     with sqlite3.connect(TRIAL_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT uid, email, started_at, trial_until FROM trial_usage WHERE uid = ?",
+            "SELECT uid, email, started_at, trial_until, device_key FROM trial_usage WHERE uid = ?",
             (uid,),
         ).fetchone()
     if row is None:
@@ -105,18 +160,183 @@ def _trial_row(uid: str) -> Optional[Dict[str, Any]]:
     return dict(row)
 
 
-def _trial_key_for_user(current_user: CurrentUser) -> str:
-    """Separate guest trial from Google account trial.
+def _trial_device_row(device_key: str) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT uid, email, started_at, trial_until, device_key
+            FROM trial_usage
+            WHERE device_key = ?
+            """,
+            (device_key,),
+        ).fetchone()
+    return dict(row) if row else None
 
-    Firebase may keep the same UID when an anonymous guest is linked to Google.
-    Product decision: a guest/session trial and a Google account trial should not
-    accidentally share the same remaining time. Therefore Google users are keyed
-    by e-mail, guests by anonymous UID.
-    """
+
+def _bind_legacy_trial_to_device(uid: str, device_key: Optional[str]) -> None:
+    """Attach pre-device-key trial rows to the first device that uses them."""
+    if not device_key:
+        return
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        try:
+            conn.execute(
+                """
+                UPDATE trial_usage
+                SET device_key = ?
+                WHERE uid = ? AND device_key IS NULL
+                """,
+                (device_key, uid),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # This device already has another trial marker. Both the legacy
+            # account and the device remain ineligible, so no access is added.
+            conn.rollback()
+
+
+def _device_usage_key(raw_device_id: Optional[str], current_user: CurrentUser) -> str:
+    """Hash App Set ID before storage; fall back to UID for legacy clients."""
+    raw = (raw_device_id or "").strip()
+    if not raw or len(raw) > 256:
+        raw = f"legacy-uid:{current_user.uid}"
+    return hashlib.sha256(f"{DEVICE_ID_SALT}|{raw}".encode("utf-8")).hexdigest()
+
+
+def _prepare_device_usage(raw_device_id: Optional[str], current_user: CurrentUser) -> str:
+    _maybe_purge_anti_abuse_data()
+    device_key = _device_usage_key(raw_device_id, current_user)
+    # Preserve usage accrued before this release when the counter was UID-based.
+    ensure_device_usage(device_key, seed_used=get_free_used(current_user.uid))
+    return device_key
+
+
+def _purge_deleted_trial_tombstones() -> None:
+    cutoff = _dt_to_iso(_utc_now() - timedelta(days=ANTI_ABUSE_RETENTION_DAYS))
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM trial_usage
+            WHERE deleted_at IS NOT NULL AND deleted_at < ?
+            """,
+            (cutoff,),
+        )
+        conn.commit()
+
+
+def _maybe_purge_anti_abuse_data() -> None:
+    global _last_anti_abuse_cleanup_at
+    now = _utc_now()
+    if (
+        _last_anti_abuse_cleanup_at is not None
+        and now - _last_anti_abuse_cleanup_at < timedelta(hours=6)
+    ):
+        return
+    purge_stale_device_usage(ANTI_ABUSE_RETENTION_DAYS)
+    _purge_deleted_trial_tombstones()
+    _last_anti_abuse_cleanup_at = now
+
+
+def _trial_key_for_user(current_user: CurrentUser) -> str:
+    """Trial identity is a signed-in Firebase account, never a guest session."""
+    return f"firebase:{current_user.uid}"
+
+
+def _legacy_trial_keys_for_user(current_user: CurrentUser) -> List[str]:
+    """Keys used by builds before device-bound trial enforcement."""
+    keys = [f"anon:{current_user.uid}", current_user.uid]
     email = (current_user.email or "").strip().lower()
-    if email and not current_user.is_anonymous:
-        return f"google:{email}"
-    return f"anon:{current_user.uid}"
+    if email:
+        keys.insert(0, f"google:{email}")
+    return list(dict.fromkeys(keys))
+
+
+def _migrate_legacy_trial_for_user(
+    current_user: CurrentUser,
+    device_key: Optional[str],
+) -> None:
+    """Preserve old trials so an update cannot grant another one."""
+    trial_key = _trial_key_for_user(current_user)
+    if _trial_row(trial_key) is not None:
+        _bind_legacy_trial_to_device(trial_key, device_key)
+        return
+
+    legacy_keys = _legacy_trial_keys_for_user(current_user)
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        legacy_row = None
+        for legacy_key in legacy_keys:
+            legacy_row = conn.execute(
+                "SELECT uid FROM trial_usage WHERE uid = ?",
+                (legacy_key,),
+            ).fetchone()
+            if legacy_row:
+                break
+
+        if legacy_row:
+            legacy_uid = legacy_row[0]
+            try:
+                conn.execute(
+                    """
+                    UPDATE trial_usage
+                    SET uid = ?, device_key = COALESCE(device_key, ?)
+                    WHERE uid = ?
+                    """,
+                    (trial_key, device_key, legacy_uid),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                # Another trial can already own this device. The account marker
+                # must still migrate, while the existing device marker remains.
+                conn.rollback()
+                try:
+                    conn.execute(
+                        "UPDATE trial_usage SET uid = ? WHERE uid = ?",
+                        (trial_key, legacy_uid),
+                    )
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+            return
+
+    # Some older builds stored trial state in pro_users rather than
+    # trial_usage. Convert that state into a permanent one-time marker too.
+    legacy_pro = get_pro_record(current_user.uid)
+    started_at = legacy_pro.get("trial_started_at")
+    if not started_at:
+        return
+    trial_until = legacy_pro.get("trial_until") or started_at
+
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO trial_usage
+                    (uid, email, started_at, trial_until, device_key)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    trial_key,
+                    current_user.email,
+                    started_at,
+                    trial_until,
+                    device_key,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO trial_usage
+                        (uid, email, started_at, trial_until, device_key)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (trial_key, current_user.email, started_at, trial_until),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
 
 
 def _trial_remaining_payload(until: Optional[datetime]) -> Dict[str, Any]:
@@ -135,20 +355,29 @@ def _trial_remaining_payload(until: Optional[datetime]) -> Dict[str, Any]:
     return {"trial_remaining_seconds": seconds, "trial_remaining_days": days}
 
 
-def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str, Any]:
+def get_trial_status_for_uid(
+    uid: str,
+    email: Optional[str] = None,
+    device_key: Optional[str] = None,
+) -> Dict[str, Any]:
     row = _trial_row(uid)
     now = _utc_now()
 
     if row is None:
+        device_used = bool(device_key and _trial_device_row(device_key))
         return {
             "is_trial_active": False,
-            "trial_available": True,
+            "trial_available": not device_used,
             "trial_started": False,
             "trial_until": None,
             "trial_days": TRIAL_DAYS,
+            "trial_unavailable_reason": "device_used" if device_used else None,
             "email": email,
             **_trial_remaining_payload(None),
         }
+
+    if row.get("device_key") is None:
+        _bind_legacy_trial_to_device(uid, device_key)
 
     until = _parse_iso_dt(row.get("trial_until"))
     active = bool(until and until > now)
@@ -159,47 +388,79 @@ def get_trial_status_for_uid(uid: str, email: Optional[str] = None) -> Dict[str,
         "trial_started": True,
         "trial_until": row.get("trial_until"),
         "trial_days": TRIAL_DAYS,
+        "trial_unavailable_reason": "account_used",
         "email": row.get("email") or email,
         **_trial_remaining_payload(until),
     }
 
 
-def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
-    """Start 3-day trial for any Firebase user, including anonymous guest.
+def start_trial_for_user(current_user: CurrentUser, device_key: str) -> Dict[str, Any]:
+    """Start one manual 3-day trial per signed-in account and device."""
+    if not is_google_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "GOOGLE_LOGIN_REQUIRED"},
+        )
 
-    Important: this is intentionally NOT limited to Google accounts.
-    The product decision is: every new user should be able to test PRO for 3 days.
-    Firebase anonymous auth gives us a stable UID for that install/session, and Google
-    login can still be used later for account continuity.
-    """
+    _migrate_legacy_trial_for_user(current_user, device_key)
     trial_key = _trial_key_for_user(current_user)
-    status = get_trial_status_for_uid(trial_key, current_user.email)
+    status = get_trial_status_for_uid(trial_key, current_user.email, device_key)
 
-    # Trial already exists. If still active, keep PRO. If expired, return FREE state
-    # instead of throwing 409, so automatic checks do not show scary errors.
     if status.get("trial_started"):
         return {
             **status,
             "is_pro": status.get("is_trial_active") == True,
         }
 
+    if not status.get("trial_available"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "TRIAL_ALREADY_USED",
+                "reason": status.get("trial_unavailable_reason"),
+            },
+        )
+
     now = _utc_now()
     until = now + timedelta(days=TRIAL_DAYS)
 
     with sqlite3.connect(TRIAL_DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO trial_usage (uid, email, started_at, trial_until)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                trial_key,
-                current_user.email,
-                _dt_to_iso(now),
-                _dt_to_iso(until),
-            ),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_account = conn.execute(
+                "SELECT uid FROM trial_usage WHERE uid = ?",
+                (trial_key,),
+            ).fetchone()
+            existing_device = conn.execute(
+                "SELECT uid FROM trial_usage WHERE device_key = ?",
+                (device_key,),
+            ).fetchone()
+            if existing_account or existing_device:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "TRIAL_ALREADY_USED"},
+                )
+            conn.execute(
+                """
+                INSERT INTO trial_usage (uid, email, started_at, trial_until, device_key)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    trial_key,
+                    current_user.email,
+                    _dt_to_iso(now),
+                    _dt_to_iso(until),
+                    device_key,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "TRIAL_ALREADY_USED"},
+            )
 
     return {
         "is_pro": True,
@@ -208,8 +469,38 @@ def start_trial_for_user(current_user: CurrentUser) -> Dict[str, Any]:
         "trial_started": True,
         "trial_until": _dt_to_iso(until),
         "trial_days": TRIAL_DAYS,
+        "trial_unavailable_reason": None,
+        "trial_requires_google": False,
         "email": current_user.email,
         **_trial_remaining_payload(until),
+    }
+
+
+def get_trial_status_for_user(
+    current_user: CurrentUser,
+    device_key: str,
+) -> Dict[str, Any]:
+    _migrate_legacy_trial_for_user(current_user, device_key)
+    if not is_google_user(current_user):
+        return {
+            "is_trial_active": False,
+            "trial_available": False,
+            "trial_started": False,
+            "trial_until": None,
+            "trial_days": TRIAL_DAYS,
+            "trial_requires_google": True,
+            "trial_unavailable_reason": "google_login_required",
+            "email": None,
+            **_trial_remaining_payload(None),
+        }
+
+    return {
+        **get_trial_status_for_uid(
+            _trial_key_for_user(current_user),
+            current_user.email,
+            device_key,
+        ),
+        "trial_requires_google": False,
     }
 
 
@@ -249,7 +540,10 @@ SUPPORTED_LANGS = {"pl", "de", "en"}
 
 
 @app.get("/trial/status")
-def trial_status(current_user: CurrentUser = Depends(get_current_user)):
+def trial_status(
+    current_user: CurrentUser = Depends(get_current_user),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
     upsert_user(
         uid=current_user.uid,
         email=current_user.email,
@@ -259,10 +553,8 @@ def trial_status(current_user: CurrentUser = Depends(get_current_user)):
 
     # GET must never activate a trial. A new account remains FREE until the
     # user explicitly calls POST /trial/start.
-    trial = get_trial_status_for_uid(
-        _trial_key_for_user(current_user),
-        current_user.email,
-    )
+    device_key = _prepare_device_usage(x_device_id, current_user)
+    trial = get_trial_status_for_user(current_user, device_key)
     paid_pro = is_paid_pro_user(current_user.uid)
 
     return {
@@ -276,7 +568,10 @@ def trial_status(current_user: CurrentUser = Depends(get_current_user)):
 
 
 @app.post("/trial/start")
-def trial_start(current_user: CurrentUser = Depends(get_current_user)):
+def trial_start(
+    current_user: CurrentUser = Depends(get_current_user),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
     upsert_user(
         uid=current_user.uid,
         email=current_user.email,
@@ -284,7 +579,8 @@ def trial_start(current_user: CurrentUser = Depends(get_current_user)):
         provider=current_user.provider,
     )
 
-    trial = start_trial_for_user(current_user)
+    device_key = _prepare_device_usage(x_device_id, current_user)
+    trial = start_trial_for_user(current_user, device_key)
 
     return {
         **trial,
@@ -294,7 +590,10 @@ def trial_start(current_user: CurrentUser = Depends(get_current_user)):
 
 
 @app.get("/entitlements/status")
-def entitlements_status(current_user: CurrentUser = Depends(get_current_user)):
+def entitlements_status(
+    current_user: CurrentUser = Depends(get_current_user),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
     """Single source of truth for the FREE / TRIAL / paid PRO UI state."""
     upsert_user(
         uid=current_user.uid,
@@ -309,22 +608,14 @@ def entitlements_status(current_user: CurrentUser = Depends(get_current_user)):
         # Entitlement reads remain available during a temporary Google outage.
         print("Google Play refresh skipped:", exc)
 
-    trial = get_trial_status_for_uid(
-        _trial_key_for_user(current_user),
-        current_user.email,
-    )
+    device_key = _prepare_device_usage(x_device_id, current_user)
+    trial = get_trial_status_for_user(current_user, device_key)
     paid_pro = is_paid_pro_user(current_user.uid)
-    tester_emails = {
-        e.strip().lower()
-        for e in os.getenv("SAFE_CONTRACT_TESTER_EMAILS", "").split(",")
-        if e.strip()
-    }
-    email = (current_user.email or "").strip().lower()
-    tester = bool(email and email in tester_emails)
+    tester = is_tester_user(current_user)
     trial_active = trial.get("is_trial_active") == True
     effective_pro = paid_pro or tester or trial_active
-    used = get_free_used(current_user.uid)
-    free_limit = 999999 if effective_pro else (1 if current_user.is_anonymous else 2)
+    used = get_device_free_used(device_key)
+    free_limit = 999999 if effective_pro else FREE_ANALYSIS_LIMIT
 
     return {
         **trial,
@@ -339,6 +630,66 @@ def entitlements_status(current_user: CurrentUser = Depends(get_current_user)):
         "free_left": max(free_limit - used, 0),
         "is_anonymous": current_user.is_anonymous,
     }
+
+
+@app.delete("/account")
+def delete_account(
+    current_user: CurrentUser = Depends(get_current_user),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
+    """Delete the app account and account-linked data.
+
+    The anonymous device counter is retained without e-mail/account data solely
+    to prevent repeated FREE/trial abuse. Google Play subscriptions must be
+    cancelled separately in Google Play.
+    """
+    device_key = _prepare_device_usage(x_device_id, current_user)
+    _migrate_legacy_trial_for_user(current_user, device_key)
+    trial_keys = [
+        _trial_key_for_user(current_user),
+        *_legacy_trial_keys_for_user(current_user),
+    ]
+    placeholders = ",".join("?" for _ in trial_keys)
+    with sqlite3.connect(TRIAL_DB_PATH) as conn:
+        rows = conn.execute(
+            f"SELECT uid FROM trial_usage WHERE uid IN ({placeholders})",
+            trial_keys,
+        ).fetchall()
+        deleted_at = _dt_to_iso(_utc_now())
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE trial_usage
+                SET uid = ?, email = NULL, deleted_at = ?
+                WHERE uid = ?
+                """,
+                (f"deleted:{uuid.uuid4()}", deleted_at, row[0]),
+            )
+        conn.commit()
+
+    delete_all_history(current_user.uid)
+    delete_pro_user(current_user.uid)
+    delete_user_usage(current_user.uid)
+    delete_firebase_user(current_user.uid)
+    return {"ok": True}
+
+
+@app.get("/account/delete-info", response_class=HTMLResponse)
+def account_delete_info():
+    contact = html.escape(
+        os.getenv("ACCOUNT_DELETION_EMAIL", "safecontractdev@gmail.com").strip(),
+        quote=True,
+    )
+    return f"""<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><title>Usunięcie konta SafeContract</title></head>
+<body style="font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 20px">
+<h1>Usunięcie konta SafeContract</h1>
+<p>Konto i powiązane dane możesz usunąć bezpośrednio w aplikacji: Moje konto → Usuń konto i dane.</p>
+<p>Możesz również wysłać prośbę na <a href="mailto:{contact}">{contact}</a>.</p>
+<p>Wgrane pliki PDF/DOCX są usuwane z serwera bezpośrednio po odczytaniu tekstu. Historia analiz pozostaje powiązana z kontem do czasu jej usunięcia przez użytkownika lub usunięcia konta.</p>
+<p>Usuwamy konto Firebase, historię analiz oraz dane PRO powiązane z kontem. Dla zapobiegania wielokrotnemu wykorzystywaniu limitu FREE i triala zachowujemy wyłącznie pseudonimowy skrót identyfikatora urządzenia i licznik — bez adresu e-mail — maksymalnie przez {ANTI_ABUSE_RETENTION_DAYS} dni od ostatniej aktywności. Znacznik wykorzystanego triala po usunięciu konta przechowujemy maksymalnie przez {ANTI_ABUSE_RETENTION_DAYS} dni.</p>
+<p>Usunięcie konta nie anuluje subskrypcji Google Play. Subskrypcją zarządzasz w Google Play.</p>
+</body></html>"""
 
 
 
@@ -428,6 +779,18 @@ def store_cached_ai(cache_key: str, payload: Dict[str, Any]) -> None:
     cache = _load_ai_cache()
     cache[cache_key] = payload
     _save_ai_cache(cache)
+
+
+def _remove_uploaded_artifacts(path: str) -> None:
+    candidates = {path}
+    if path.lower().endswith(".pdf"):
+        candidates.add(path[:-4] + "_repaired.pdf")
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        except Exception as exc:
+            print("Temporary document cleanup failed:", type(exc).__name__)
 
 
 def choose_doc_locale(text: str) -> str:
@@ -1433,6 +1796,7 @@ async def upload_document(
     result_lang: str = Form("en"),
     mode: str = Form("normal"),
     current_user: CurrentUser = Depends(get_current_user),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
 ):
     result_lang = (result_lang or "en").lower()
     if result_lang not in SUPPORTED_LANGS:
@@ -1450,20 +1814,18 @@ async def upload_document(
     )
 
     # Uploading a document must not silently start the trial either.
-    trial_status_data = get_trial_status_for_uid(
-        _trial_key_for_user(current_user),
-        current_user.email,
-    )
+    device_key = _prepare_device_usage(x_device_id, current_user)
+    trial_status_data = get_trial_status_for_user(current_user, device_key)
     paid_pro = is_paid_pro_user(current_user.uid)
-    pro = paid_pro or trial_status_data.get("is_trial_active") == True
-    used_before = get_free_used(current_user.uid)
+    tester = is_tester_user(current_user)
+    pro = paid_pro or tester or trial_status_data.get("is_trial_active") == True
+    used_before = get_device_free_used(device_key)
 
-    dynamic_free_limit = 999999 if pro else (1 if current_user.is_anonymous else 2)
+    dynamic_free_limit = 999999 if pro else FREE_ANALYSIS_LIMIT
     free_left_before = max(dynamic_free_limit - used_before, 0)
 
     print(
-        f"DEBUG uid={current_user.uid} provider={current_user.provider} "
-        f"is_anonymous={current_user.is_anonymous} "
+        f"ENTITLEMENT anonymous={current_user.is_anonymous} "
         f"pro={pro} used={used_before} limit={dynamic_free_limit}"
     )
 
@@ -1486,17 +1848,20 @@ async def upload_document(
     name = f"{uuid.uuid4()}{ext}"
     path = os.path.join(UPLOAD_DIR, name)
 
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    extraction = _extract_text(path)
+    try:
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        extraction = _extract_text(path)
+    finally:
+        # Contract files, including repaired PDF copies, are needed only for
+        # extraction and are not retained by the API afterwards.
+        _remove_uploaded_artifacts(path)
     text = extraction["text"] or ""
 
     print("📄 EXTRACT METHOD:", extraction.get("extract_method"))
     print("📄 USED OCR:", extraction.get("used_ocr"))
     print("📄 OCR AVG CONF:", extraction.get("ocr_avg_conf"))
     print("📄 TEXT LEN:", len(text))
-    print("📄 TEXT SAMPLE:", re.sub(r"\\s+", " ", text[:1000]))
 
     if not text.strip() or extraction.get("extract_method") == "fallback":
         return JSONResponse(
@@ -1511,7 +1876,7 @@ async def upload_document(
         )
 
     if not looks_like_legal_document(text):
-        print("❌ NOT CONTRACT SAMPLE:", re.sub(r"\\s+", " ", text[:1500]))
+        print("❌ NOT CONTRACT, extracted length:", len(text))
         return JSONResponse(
             status_code=400,
             content={
@@ -1532,7 +1897,7 @@ async def upload_document(
 
     if pro and wants_ai:
         cache_key = make_ai_cache_key(text=text, doc_locale=doc_locale, result_lang=result_lang, mode=mode)
-        ai_payload = find_cached_ai(cache_key)
+        ai_payload = find_cached_ai(cache_key) if AI_CACHE_ENABLED else None
 
         if ai_payload is None:
             ai_payload = generate_ai_explanation(
@@ -1542,7 +1907,7 @@ async def upload_document(
                 result_lang=result_lang,
                 mode=mode,
             )
-            if isinstance(ai_payload, dict):
+            if AI_CACHE_ENABLED and isinstance(ai_payload, dict):
                 store_cached_ai(cache_key, ai_payload)
 
         if isinstance(ai_payload, dict):
@@ -1559,7 +1924,7 @@ async def upload_document(
     free_left_after = free_left_before
 
     if not pro:
-        free_used_after = increment_free_used(current_user.uid)
+        free_used_after = increment_device_free_used(device_key)
         free_left_after = max(dynamic_free_limit - free_used_after, 0)
 
     response = {
@@ -1568,7 +1933,10 @@ async def upload_document(
         "original_filename": file.filename,
         "is_pro": pro,
         "is_paid_pro": paid_pro,
-        "is_trial_active": trial_status_data.get("is_trial_active") == True and not paid_pro,
+        "is_trial_active": (
+            trial_status_data.get("is_trial_active") == True
+            and not (paid_pro or tester)
+        ),
         "trial_until": trial_status_data.get("trial_until"),
         "trial_available": trial_status_data.get("trial_available"),
         "user_id": current_user.uid,
@@ -1596,4 +1964,8 @@ async def upload_document(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "analysis_version": "v7_trial_account_timefix"}
+    return {
+        "ok": True,
+        "analysis_version": "v8_device_entitlements",
+        "free_limit": FREE_ANALYSIS_LIMIT,
+    }
